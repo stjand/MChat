@@ -1,103 +1,206 @@
+// src/components/MegaChat.tsx
 import { useState, useEffect, useRef } from 'react';
 import { Send, Flame, Heart, Eye, Laugh, Pin, Flag } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { supabase } from '../lib/supabase';
 import { Message } from '../types';
+
+interface DBMessage {
+  id: string;
+  user_id: string;
+  content: string;
+  reactions: { fire: number; laugh: number; heart: number; eyes: number };
+  is_pinned: boolean;
+  created_at: string;
+  users: {
+    username: string;
+    is_verified: boolean;
+  };
+}
 
 export default function MegaChat() {
   const { user, updateKarma, incrementMessageCount } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
+  const [loading, setLoading] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const realtimeChannel = useRef<any>(null);
 
   useEffect(() => {
-    const mockMessages: Message[] = [
-      {
-        id: '1',
-        userId: 'system',
-        username: 'CampusBot',
-        content: 'Welcome to Mega Chat! Drop your confessions, memes, or just say hi 👋',
-        isVerifiedAuthor: true,
-        reactions: { fire: 23, laugh: 8, heart: 15, eyes: 5 },
-        isPinned: true,
-        createdAt: new Date(Date.now() - 3600000),
-      },
-      {
-        id: '2',
-        userId: 'user2',
-        username: 'GoldenEagle547',
-        content: 'Anyone else procrastinating their assignment due tomorrow? 😅',
-        isVerifiedAuthor: false,
-        reactions: { fire: 12, laugh: 34, heart: 3, eyes: 8 },
-        isPinned: false,
-        createdAt: new Date(Date.now() - 1800000),
-      },
-      {
-        id: '3',
-        userId: 'user3',
-        username: 'verified_student ✅',
-        content: 'Just saw my ex in the library and pretended to be on a very important phone call',
-        isVerifiedAuthor: true,
-        reactions: { fire: 5, laugh: 67, heart: 12, eyes: 23 },
-        isPinned: false,
-        createdAt: new Date(Date.now() - 900000),
-      },
-      {
-        id: '4',
-        userId: 'user4',
-        username: 'CrimsonWolf892',
-        content: 'Hot take: The cafeteria food is actually good',
-        isVerifiedAuthor: false,
-        reactions: { fire: 2, laugh: 15, heart: 1, eyes: 8 },
-        isPinned: false,
-        createdAt: new Date(Date.now() - 300000),
-      },
-    ];
-    setMessages(mockMessages);
+    loadMessages();
+    subscribeToMessages();
+
+    return () => {
+      if (realtimeChannel.current) {
+        supabase.removeChannel(realtimeChannel.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const handleSendMessage = (e: React.FormEvent) => {
+  const loadMessages = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .select(`
+          id,
+          user_id,
+          content,
+          reactions,
+          is_pinned,
+          created_at,
+          users (
+            username,
+            is_verified
+          )
+        `)
+        .eq('is_mega_chat', true)
+        .order('created_at', { ascending: true })
+        .limit(100);
+
+      if (error) throw error;
+
+      const formattedMessages: Message[] = (data as any[]).map((msg: any) => ({
+        id: msg.id,
+        userId: msg.user_id,
+        username: msg.users.is_verified ? `${msg.users.username} ✅` : msg.users.username,
+        content: msg.content,
+        isVerifiedAuthor: msg.users.is_verified,
+        reactions: msg.reactions,
+        isPinned: msg.is_pinned,
+        createdAt: new Date(msg.created_at),
+      }));
+
+      setMessages(formattedMessages);
+    } catch (error) {
+      console.error('Error loading messages:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const subscribeToMessages = () => {
+    realtimeChannel.current = supabase
+      .channel('mega_chat_messages')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: 'is_mega_chat=eq.true',
+        },
+        async (payload) => {
+          // Fetch the complete message with user info
+          const { data, error } = await supabase
+            .from('messages')
+            .select(`
+              id,
+              user_id,
+              content,
+              reactions,
+              is_pinned,
+              created_at,
+              users (
+                username,
+                is_verified
+              )
+            `)
+            .eq('id', payload.new.id)
+            .single();
+
+          if (!error && data) {
+            const newMsg: Message = {
+              id: data.id,
+              userId: data.user_id,
+              username: (data.users as any).is_verified 
+                ? `${(data.users as any).username} ✅` 
+                : (data.users as any).username,
+              content: data.content,
+              isVerifiedAuthor: (data.users as any).is_verified,
+              reactions: data.reactions,
+              isPinned: data.is_pinned,
+              createdAt: new Date(data.created_at),
+            };
+
+            setMessages((prev) => [...prev, newMsg]);
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'messages',
+          filter: 'is_mega_chat=eq.true',
+        },
+        (payload) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === payload.new.id
+                ? { ...msg, reactions: payload.new.reactions, isPinned: payload.new.is_pinned }
+                : msg
+            )
+          );
+        }
+      )
+      .subscribe();
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMessage.trim() || !user) return;
 
-    if (!incrementMessageCount()) {
+    const canSend = await incrementMessageCount();
+    if (!canSend) {
       alert('Daily message limit reached! Get verified for unlimited messages.');
       return;
     }
 
-    const message: Message = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      username: user.isVerified ? `${user.username} ✅` : user.username,
-      content: newMessage,
-      isVerifiedAuthor: user.isVerified,
-      reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-      isPinned: false,
-      createdAt: new Date(),
-    };
+    try {
+      const { error } = await supabase.from('messages').insert({
+        user_id: user.id,
+        content: newMessage,
+        is_mega_chat: true,
+        reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+        is_pinned: false,
+      });
 
-    setMessages([...messages, message]);
-    setNewMessage('');
-    updateKarma(1);
+      if (error) throw error;
+
+      setNewMessage('');
+      await updateKarma(1);
+    } catch (error) {
+      console.error('Error sending message:', error);
+      alert('Failed to send message. Please try again.');
+    }
   };
 
-  const handleReaction = (messageId: string, reactionType: keyof Message['reactions']) => {
-    setMessages(messages.map(msg => {
-      if (msg.id === messageId) {
-        return {
-          ...msg,
-          reactions: {
-            ...msg.reactions,
-            [reactionType]: msg.reactions[reactionType] + 1,
-          },
-        };
-      }
-      return msg;
-    }));
-    updateKarma(1);
+  const handleReaction = async (messageId: string, reactionType: keyof Message['reactions']) => {
+    try {
+      const message = messages.find((m) => m.id === messageId);
+      if (!message) return;
+
+      const updatedReactions = {
+        ...message.reactions,
+        [reactionType]: message.reactions[reactionType] + 1,
+      };
+
+      const { error } = await supabase
+        .from('messages')
+        .update({ reactions: updatedReactions })
+        .eq('id', messageId);
+
+      if (error) throw error;
+
+      await updateKarma(1);
+    } catch (error) {
+      console.error('Error adding reaction:', error);
+    }
   };
 
   const formatTime = (date: Date) => {
@@ -111,6 +214,17 @@ export default function MegaChat() {
     if (hours < 24) return `${hours}h ago`;
     return date.toLocaleDateString();
   };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-full bg-slate-900">
+        <div className="text-center">
+          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <p className="text-slate-400">Loading messages...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full bg-slate-900">
