@@ -1,7 +1,9 @@
+// src/components/WelcomeScreen.tsx
 import { useState } from 'react';
 import { Zap, Shield, Users, Sparkles } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { Gender } from '../types';
+import { isCollegeEmail } from '../utils/emailVerification'; // <-- NEW IMPORT
 
 export default function WelcomeScreen() {
   const { enterAnonymous, login } = useAuth();
@@ -11,10 +13,12 @@ export default function WelcomeScreen() {
 
   const handleVerifiedLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (email.includes('@') && email.includes('.edu')) {
+    
+    // Use the utility function for robust email check
+    if (isCollegeEmail(email)) {
       login(email, gender);
     } else {
-      alert('Please enter a valid college email (.edu)');
+      alert('Please enter a valid college email address (e.g., ending in .edu, .ac.uk)');
     }
   };
 

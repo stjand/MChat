@@ -3,6 +3,7 @@ import { Users, Send, ArrowLeft, RotateCcw, Sparkles } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { getRandomIcebreaker } from '../utils/username';
 import { Message } from '../types';
+import { MatchmakingService } from '../services/matchmaking'; // <-- NEW
 
 type RoomSize = 2 | 3 | 4;
 
@@ -15,43 +16,68 @@ export default function SmallRooms() {
   const [icebreaker, setIcebreaker] = useState('');
   const [participants, setParticipants] = useState<string[]>([]);
   const [isMatching, setIsMatching] = useState(false);
+  const [roomId, setRoomId] = useState<string | null>(null); // <-- NEW: State to hold the current room ID
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const startMatching = (size: RoomSize) => {
+  // Cleanup for unmount or component state change
+  useEffect(() => {
+    return () => {
+      // Cancel matchmaking if component unmounts while matching
+      if (user && isMatching) {
+        MatchmakingService.cancelMatching(user.id);
+      }
+    };
+  }, [user, isMatching]);
+
+  const startMatching = async (size: RoomSize) => {
+    if (!user) return;
+
     setRoomSize(size);
     setIsMatching(true);
 
-    setTimeout(() => {
-      const mockParticipants = Array.from({ length: size - 1 }, (_, i) =>
-        `Stranger${i + 1}`
-      );
-      setParticipants([user?.username || 'You', ...mockParticipants]);
-      setIcebreaker(getRandomIcebreaker());
+    try {
+      // Real Matchmaking Service Call
+      const matchResult = await MatchmakingService.findMatch({
+        userId: user.id,
+        roomSize: size,
+        isVerified: user.isVerified,
+        gender: user.gender,
+      });
+
+      setRoomId(matchResult.roomId);
+      setParticipants(matchResult.participants);
+      setIcebreaker(matchResult.icebreaker);
       setInRoom(true);
-      setIsMatching(false);
 
       const welcomeMessage: Message = {
         id: 'welcome',
         userId: 'system',
         username: 'System',
-        content: `${size} strangers have been matched! Icebreaker: ${getRandomIcebreaker()}`,
+        content: `${matchResult.participants.length} strangers have been matched! Icebreaker: ${matchResult.icebreaker}`,
         isVerifiedAuthor: false,
         reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
         isPinned: false,
         createdAt: new Date(),
       };
       setMessages([welcomeMessage]);
-    }, 2000);
+
+    } catch (error) {
+      console.error('Matching failed:', error);
+      alert('Matching failed or timed out. Please try again.');
+    } finally {
+      setIsMatching(false);
+    }
   };
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMessage.trim() || !user) return;
 
+    // Check message limit (real logic via AuthContext)
     if (!incrementMessageCount()) {
       alert('Daily message limit reached! Get verified for unlimited messages.');
       return;
@@ -72,8 +98,13 @@ export default function SmallRooms() {
     setNewMessage('');
     updateKarma(1);
 
+    // Mock bot response (This remains until full Supabase rooms are implemented)
     setTimeout(() => {
-      const randomParticipant = participants[Math.floor(Math.random() * (participants.length - 1)) + 1];
+      const nonCurrentUserParticipants = participants.filter(p => p !== user.username); 
+      const randomParticipant = nonCurrentUserParticipants.length > 0 
+        ? nonCurrentUserParticipants[Math.floor(Math.random() * nonCurrentUserParticipants.length)]
+        : 'Stranger';
+
       const responses = [
         'haha that\'s wild',
         'no way! same here',
@@ -100,21 +131,34 @@ export default function SmallRooms() {
     }, 1500 + Math.random() * 2000);
   };
 
-  const leaveRoom = () => {
+  const leaveRoom = async () => {
+    // 1. Handle Matching Cancellation
+    if (isMatching && user) {
+        MatchmakingService.cancelMatching(user.id);
+    }
+
+    // 2. Real Room Leave/Cleanup
+    if (user && roomId) {
+      await MatchmakingService.leaveRoom(roomId, user.id);
+    }
+    
+    // 3. Reset local state
     setInRoom(false);
     setMessages([]);
     setParticipants([]);
     setRoomSize(null);
     setIcebreaker('');
+    setRoomId(null);
+    setIsMatching(false);
   };
 
   const skipToNextRoom = () => {
     if (roomSize) {
-      leaveRoom();
+      leaveRoom(); // Leave current room/cancel matching
       setTimeout(() => startMatching(roomSize), 100);
     }
   };
-
+  
   if (isMatching) {
     return (
       <div className="flex flex-col items-center justify-center h-full bg-slate-900 p-8">

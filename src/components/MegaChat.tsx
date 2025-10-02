@@ -125,8 +125,10 @@ export default function MegaChat() {
               isPinned: data.is_pinned,
               createdAt: new Date(data.created_at),
             };
+            
 
             setMessages((prev) => [...prev, newMsg]);
+            
           }
         }
       )

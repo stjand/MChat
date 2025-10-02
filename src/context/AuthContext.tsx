@@ -31,7 +31,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
-        loadUserProfile(session.user.id);
+        // Pass session user to loadUserProfile to use email if profile needs creation
+        loadUserProfile(session.user.id, session.user); 
       } else {
         setUser(null);
         setUserMode('anonymous');
@@ -45,7 +46,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (session?.user) {
-        await loadUserProfile(session.user.id);
+        await loadUserProfile(session.user.id, session.user);
       }
     } catch (error) {
       console.error('Error checking user:', error);
@@ -54,15 +55,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const loadUserProfile = async (userId: string) => {
+  // Modified to accept SupabaseUser to create profile if not found
+  const loadUserProfile = async (userId: string, authUser?: SupabaseUser) => {
     try {
-      const { data, error } = await supabase
+      let { data, error } = await supabase
         .from('users')
         .select('*')
         .eq('id', userId)
         .single();
 
-      if (error) throw error;
+      // CRITICAL FIX: If profile not found (PGRST116), create a default verified profile
+      if (error && error.code === 'PGRST116') {
+        
+        // Ensure we have the necessary user info from the session
+        if (!authUser || !authUser.email) {
+            throw new Error("User session data missing during profile creation.");
+        }
+
+        const newUserProfile = {
+          id: userId,
+          username: authUser.email.split('@')[0] || generateAnonymousUsername(),
+          is_verified: true,
+          gender: 'unspecified' as Gender,
+          college_email: authUser.email,
+          college_name: authUser.email.split('@')[1]?.split('.')[0] || null, // Basic college name inference
+          karma_points: 0,
+          is_anonymous: false,
+          badges: ['verified'],
+          daily_message_count: 0,
+        };
+
+        const { data: insertData, error: insertError } = await supabase
+          .from('users')
+          .insert(newUserProfile)
+          .select()
+          .single();
+
+        if (insertError) throw insertError;
+        data = insertData;
+        
+      } else if (error) {
+        throw error;
+      }
+      // END CRITICAL FIX
 
       if (data) {
         const userProfile: User = {
@@ -111,6 +146,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (insertError) throw insertError;
 
+        // Use loadUserProfile to load the newly created anonymous profile
         await loadUserProfile(authData.user.id);
       }
     } catch (error) {
@@ -131,9 +167,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (signInError) throw signInError;
 
-      // After email verification, create/update user profile
-      // This will be handled by the auth state change listener
+      // After email verification, profile creation/update is handled by auth state change listener (loadUserProfile)
       alert('Check your email for the verification link!');
+      
+      // NOTE: We should also update the user's gender here if the profile exists, 
+      // but for simplicity, we rely on the redirect and the user to update their profile later 
+      // if the gender input was used only for initial sign-up context.
+      
     } catch (error) {
       console.error('Error logging in:', error);
       throw error;
@@ -199,7 +239,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const refreshUser = async () => {
     if (user) {
-      await loadUserProfile(user.id);
+      // Reload the user profile without requiring authUser from session
+      await loadUserProfile(user.id); 
     }
   };
 
