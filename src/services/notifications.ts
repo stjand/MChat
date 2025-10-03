@@ -1,7 +1,7 @@
+// src/services/notifications.ts
 import { supabase } from "../lib/supabase";
 import webpush from 'web-push';
 
-// src/services/notifications.ts
 export class NotificationService {
   static async requestPermission(): Promise<boolean> {
     if ('Notification' in window) {

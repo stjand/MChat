@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { Send, SkipForward, CircleUser as UserCircle, Clock, Sparkles } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { getRandomIcebreaker } from '../utils/username';
+import { supabase } from '../lib/supabase';
 import { Message } from '../types';
+import { MatchmakingService } from '../services/matchmaking';
 
 export default function OneToOne() {
   const { user, updateKarma, incrementMessageCount } = useAuth();
@@ -14,7 +15,9 @@ export default function OneToOne() {
   const [icebreaker, setIcebreaker] = useState('');
   const [showIdentity, setShowIdentity] = useState(false);
   const [timer, setTimer] = useState(180);
+  const [roomId, setRoomId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const realtimeChannel = useRef<any>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -23,7 +26,7 @@ export default function OneToOne() {
   useEffect(() => {
     if (inChat && !showIdentity) {
       const interval = setInterval(() => {
-        setTimer(prev => {
+        setTimer((prev) => {
           if (prev <= 1) {
             setShowIdentity(true);
             clearInterval(interval);
@@ -37,100 +40,204 @@ export default function OneToOne() {
     }
   }, [inChat, showIdentity]);
 
-  const startMatching = () => {
+  useEffect(() => {
+    return () => {
+      if (realtimeChannel.current) {
+        supabase.removeChannel(realtimeChannel.current);
+      }
+    };
+  }, []);
+
+  const loadRoomMessages = async (currentRoomId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .select(`
+          id, user_id, content, reactions, is_pinned, created_at,
+          users (username, is_verified)
+        `)
+        .eq('room_id', currentRoomId)
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+
+      const formattedMessages: Message[] = (data || [])
+        .filter((msg: any) => msg.users)
+        .map((msg: any) => ({
+          id: msg.id,
+          userId: msg.user_id,
+          username: msg.users.username,
+          content: msg.content,
+          isVerifiedAuthor: msg.users.is_verified,
+          reactions: msg.reactions,
+          isPinned: msg.is_pinned,
+          createdAt: new Date(msg.created_at),
+        }));
+
+      setMessages(formattedMessages);
+    } catch (error) {
+      console.error('Error loading room messages:', error);
+    }
+  };
+
+  const subscribeToRoom = (currentRoomId: string) => {
+    if (realtimeChannel.current) {
+      supabase.removeChannel(realtimeChannel.current);
+    }
+
+    realtimeChannel.current = supabase
+      .channel(`room:${currentRoomId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: `room_id=eq.${currentRoomId}`,
+        },
+        async (payload) => {
+          const { data, error } = await supabase
+            .from('messages')
+            .select(`
+              id, user_id, content, reactions, is_pinned, created_at,
+              users (username, is_verified)
+            `)
+            .eq('id', payload.new.id)
+            .single();
+
+          if (!error && data && (data as any).users) {
+            const newMsg: Message = {
+              id: data.id,
+              userId: data.user_id,
+              username: (data as any).users.username,
+              content: data.content,
+              isVerifiedAuthor: (data as any).users.is_verified,
+              reactions: data.reactions,
+              isPinned: data.is_pinned,
+              createdAt: new Date(data.created_at),
+            };
+
+            setMessages((prev) => [...prev, newMsg]);
+          }
+        }
+      )
+      .subscribe();
+  };
+
+  const startMatching = async () => {
+    if (!user) return;
+
     setIsMatching(true);
 
-    setTimeout(() => {
-      const names = ['Alex', 'Jordan', 'Casey', 'Morgan', 'Riley', 'Taylor', 'Sam'];
-      const randomName = names[Math.floor(Math.random() * names.length)];
-      setStrangerName(randomName);
-      setIcebreaker(getRandomIcebreaker());
+    try {
+      let matchResult;
+
+      if (user.isVerified && user.gender !== 'unspecified') {
+        matchResult = await MatchmakingService.findOppositeGenderMatch(
+          user.id,
+          user.gender
+        );
+      } else {
+        matchResult = await MatchmakingService.findMatch({
+          userId: user.id,
+          roomSize: 2,
+          isVerified: user.isVerified,
+          gender: user.gender,
+        });
+      }
+
+      setRoomId(matchResult.roomId);
+      const otherParticipant = matchResult.participants.find((p) => p !== user.username);
+      setStrangerName(otherParticipant || 'Stranger');
+      setIcebreaker(matchResult.icebreaker);
       setInChat(true);
-      setIsMatching(false);
       setTimer(180);
       setShowIdentity(false);
 
-      const welcomeMessage: Message = {
-        id: 'welcome',
-        userId: 'system',
-        username: 'System',
-        content: user?.isVerified
-          ? `You've been matched with an opposite-gender student! Icebreaker: ${getRandomIcebreaker()}`
-          : `You've been matched with a random stranger! Icebreaker: ${getRandomIcebreaker()}`,
-        isVerifiedAuthor: false,
-        reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-        isPinned: false,
-        createdAt: new Date(),
-      };
-      setMessages([welcomeMessage]);
-    }, 2000);
+      // Load messages and subscribe to room
+      await loadRoomMessages(matchResult.roomId);
+      subscribeToRoom(matchResult.roomId);
+    } catch (error) {
+      console.error('Matching failed:', error);
+      alert('Matching failed or timed out. Please try again.');
+    } finally {
+      setIsMatching(false);
+    }
   };
 
-  const handleSendMessage = (e: React.FormEvent) => {
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newMessage.trim() || !user) return;
+    if (!newMessage.trim() || !user || !roomId) return;
 
-    if (!incrementMessageCount()) {
+    const canSend = await incrementMessageCount();
+    if (!canSend) {
       alert('Daily message limit reached! Get verified for unlimited messages.');
       return;
     }
 
-    const message: Message = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      username: 'You',
-      content: newMessage,
-      isVerifiedAuthor: user.isVerified,
-      reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-      isPinned: false,
-      createdAt: new Date(),
-    };
-
-    setMessages([...messages, message]);
-    setNewMessage('');
-    updateKarma(1);
-
-    setTimeout(() => {
-      const responses = [
-        'haha that\'s actually so relatable',
-        'wait, are you serious? 😂',
-        'okay but same though',
-        'no way, tell me more',
-        'interesting...',
-        'lmao i feel that',
-        'honestly facts',
-        'this is actually a good convo',
-      ];
-
-      const strangerMessage: Message = {
-        id: crypto.randomUUID(),
-        userId: 'stranger',
-        username: 'Stranger',
-        content: responses[Math.floor(Math.random() * responses.length)],
-        isVerifiedAuthor: false,
+    try {
+      const { error } = await supabase.from('messages').insert({
+        user_id: user.id,
+        room_id: roomId,
+        content: newMessage,
+        is_mega_chat: false,
         reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-        isPinned: false,
-        createdAt: new Date(),
-      };
+        is_pinned: false,
+      });
 
-      setMessages(prev => [...prev, strangerMessage]);
-    }, 1500 + Math.random() * 2500);
+      if (error) throw error;
+
+      setNewMessage('');
+      await updateKarma(1);
+    } catch (error) {
+      console.error('Error sending message:', error);
+      alert('Failed to send message. Please try again.');
+    }
   };
 
-  const skipToNext = () => {
+  const skipToNext = async () => {
+    if (realtimeChannel.current) {
+      await supabase.removeChannel(realtimeChannel.current);
+      realtimeChannel.current = null;
+    }
+
+    if (user && roomId) {
+      try {
+        await MatchmakingService.leaveRoom(roomId, user.id);
+      } catch (error) {
+        console.error('Error leaving room:', error);
+      }
+    }
+
     setInChat(false);
     setMessages([]);
     setStrangerName('');
     setIcebreaker('');
+    setRoomId(null);
+
     setTimeout(() => startMatching(), 100);
   };
 
-  const endChat = () => {
+  const endChat = async () => {
+    if (realtimeChannel.current) {
+      await supabase.removeChannel(realtimeChannel.current);
+      realtimeChannel.current = null;
+    }
+
+    if (user && roomId) {
+      try {
+        await MatchmakingService.leaveRoom(roomId, user.id);
+      } catch (error) {
+        console.error('Error leaving room:', error);
+      }
+    }
+
     setInChat(false);
     setMessages([]);
     setStrangerName('');
     setIcebreaker('');
     setShowIdentity(false);
+    setRoomId(null);
   };
 
   const formatTime = (seconds: number) => {
@@ -151,7 +258,7 @@ export default function OneToOne() {
             Finding you a match...
           </h2>
           <p className="text-slate-400">
-            {user?.isVerified
+            {user?.isVerified && user.gender !== 'unspecified'
               ? 'Matching with opposite-gender verified student'
               : 'Connecting with a random stranger'}
           </p>
@@ -170,7 +277,7 @@ export default function OneToOne() {
               <span className="text-white font-semibold">
                 {showIdentity ? strangerName : 'Stranger'}
               </span>
-              {user?.isVerified && (
+              {user?.isVerified && user.gender !== 'unspecified' && (
                 <span className="text-xs bg-emerald-900/50 text-emerald-300 px-2 py-1 rounded">
                   Opposite Gender
                 </span>
@@ -205,7 +312,7 @@ export default function OneToOne() {
           {showIdentity && (
             <div className="bg-gradient-to-r from-amber-900/30 to-orange-900/30 border border-amber-700/50 rounded-lg p-3">
               <p className="text-sm text-amber-100 text-center">
-                🎉 Identities revealed! You can now see each other's names.
+                Identities revealed! You can now see each other's names.
               </p>
             </div>
           )}
@@ -218,11 +325,14 @@ export default function OneToOne() {
               className={`${
                 message.userId === user?.id
                   ? 'ml-auto bg-pink-500'
-                  : message.userId === 'system'
-                  ? 'bg-slate-700 text-center'
                   : 'mr-auto bg-slate-800'
               } max-w-[80%] rounded-2xl p-3`}
             >
+              {message.userId !== user?.id && (
+                <p className="text-xs font-semibold text-slate-400 mb-1">
+                  {showIdentity ? message.username : 'Stranger'}
+                </p>
+              )}
               <p className="text-white text-sm">{message.content}</p>
             </div>
           ))}
@@ -276,7 +386,7 @@ export default function OneToOne() {
               <span className="text-pink-400">•</span>
               <span>Skip anytime to meet someone new</span>
             </li>
-            {user?.isVerified && (
+            {user?.isVerified && user.gender !== 'unspecified' && (
               <li className="flex items-start gap-2">
                 <span className="text-emerald-400">✓</span>
                 <span className="text-emerald-300 font-medium">
@@ -297,7 +407,7 @@ export default function OneToOne() {
         {!user?.isVerified && (
           <div className="mt-6 bg-amber-900/20 border border-amber-700/50 rounded-lg p-4 text-center">
             <p className="text-sm text-amber-300">
-              Get verified to unlock opposite-gender matching!
+              Get verified to unlock opposite-gender matching
             </p>
           </div>
         )}

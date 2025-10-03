@@ -202,30 +202,58 @@ export class MatchmakingService {
 
   // Helper: Join room
   private static async joinRoom(roomId: string, userId: string) {
-    // Add participant
-    const { error: participantError } = await supabase
-      .from('room_participants')
-      .insert({ room_id: roomId, user_id: userId });
+    try {
+      // Check if already in room
+      const { data: existing } = await supabase
+        .from('room_participants')
+        .select('id')
+        .eq('room_id', roomId)
+        .eq('user_id', userId)
+        .maybeSingle();
 
-    if (participantError) throw participantError;
+      if (existing) {
+        return; // Already in room
+      }
 
-    // Increment room count
-    const { error: updateError } = await supabase.rpc('increment_room_count', {
-      room_id: roomId,
-    });
+      // Add participant
+      const { error: participantError } = await supabase
+        .from('room_participants')
+        .insert({ room_id: roomId, user_id: userId });
 
-    if (updateError) throw updateError;
+      // Ignore duplicate key errors (23505)
+      if (participantError && participantError.code !== '23505') {
+        throw participantError;
+      }
+
+      // Increment room count
+      const { error: updateError } = await supabase.rpc('increment_room_count', {
+        room_id: roomId,
+      });
+
+      if (updateError) throw updateError;
+    } catch (error) {
+      console.error('Error joining room:', error);
+      throw error;
+    }
   }
 
   // Helper: Get room participants
-  private static async getRoomParticipants(roomId: string): Promise<string[]> {
-    const { data } = await supabase
-      .from('room_participants')
-      .select('users(username)')
-      .eq('room_id', roomId);
+private static async getRoomParticipants(roomId: string): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('room_participants')
+    .select('users(username)')
+    .eq('room_id', roomId);
 
-    return data?.map((p: any) => p.users.username) || [];
+  if (error) {
+    console.error('Error getting participants:', error);
+    return [];
   }
+
+  // Filter out null users and extract usernames safely
+  return (data || [])
+    .filter((p: any) => p.users && p.users.username)
+    .map((p: any) => p.users.username);
+}
 
   // Cancel matchmaking
   static cancelMatching(userId: string) {

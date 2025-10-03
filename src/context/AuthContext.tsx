@@ -4,35 +4,40 @@ import { User as SupabaseUser } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 import { User, UserMode, Gender } from '../types';
 import { generateAnonymousUsername } from '../utils/username';
+import { validateCollegeEmail, extractCollegeName } from '../utils/emailVerification';
+
+interface AuthProviderProps {
+  children: ReactNode;
+}
 
 interface AuthContextType {
   user: User | null;
   userMode: UserMode;
   loading: boolean;
+  error: string | null;
   login: (email: string, gender: Gender) => Promise<void>;
   logout: () => Promise<void>;
   enterAnonymous: () => Promise<void>;
   updateKarma: (points: number) => Promise<void>;
   incrementMessageCount: () => Promise<boolean>;
   refreshUser: () => Promise<void>;
+  clearError: () => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: ReactNode }) {
+export function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null);
   const [userMode, setUserMode] = useState<UserMode>('anonymous');
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Check for existing session
     checkUser();
 
-    // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.user) {
-        // Pass session user to loadUserProfile to use email if profile needs creation
-        loadUserProfile(session.user.id, session.user); 
+        await loadUserProfile(session.user.id, session.user);
       } else {
         setUser(null);
         setUserMode('anonymous');
@@ -44,44 +49,59 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const checkUser = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      
+      if (sessionError) {
+        console.error('Session error:', sessionError);
+        setError('Failed to load session');
+      }
+
       if (session?.user) {
         await loadUserProfile(session.user.id, session.user);
       }
-    } catch (error) {
-      console.error('Error checking user:', error);
+    } catch (err) {
+      console.error('Error checking user:', err);
+      setError('Failed to authenticate');
     } finally {
-      setLoading(false);
+      // FIX: Use setTimeout to ensure setLoading(false) runs 
+      // as a separate task, guaranteeing state update.
+      setTimeout(() => {
+        setLoading(false);
+      }, 50); // A small delay of 50ms is usually enough
     }
   };
 
-  // Modified to accept SupabaseUser to create profile if not found
+// ...
+
   const loadUserProfile = async (userId: string, authUser?: SupabaseUser) => {
     try {
-      let { data, error } = await supabase
+      let { data, error: fetchError } = await supabase
         .from('users')
         .select('*')
         .eq('id', userId)
         .single();
 
-      // CRITICAL FIX: If profile not found (PGRST116), create a default verified profile
-      if (error && error.code === 'PGRST116') {
-        
-        // Ensure we have the necessary user info from the session
-        if (!authUser || !authUser.email) {
-            throw new Error("User session data missing during profile creation.");
+      // If profile doesn't exist, create it
+      if (fetchError && fetchError.code === 'PGRST116') {
+        if (!authUser) {
+          throw new Error('Cannot create profile without auth user data');
         }
+
+        const isVerified = !!authUser.email;
+        const username = authUser.email 
+          ? authUser.email.split('@')[0] 
+          : generateAnonymousUsername();
 
         const newUserProfile = {
           id: userId,
-          username: authUser.email.split('@')[0] || generateAnonymousUsername(),
-          is_verified: true,
+          username,
+          is_verified: isVerified,
           gender: 'unspecified' as Gender,
-          college_email: authUser.email,
-          college_name: authUser.email.split('@')[1]?.split('.')[0] || null, // Basic college name inference
+          college_email: authUser.email || null,
+          college_name: authUser.email ? extractCollegeName(authUser.email) : null,
           karma_points: 0,
-          is_anonymous: false,
-          badges: ['verified'],
+          is_anonymous: !isVerified,
+          badges: isVerified ? ['verified'] : [],
           daily_message_count: 0,
         };
 
@@ -91,13 +111,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           .select()
           .single();
 
-        if (insertError) throw insertError;
-        data = insertData;
+        if (insertError) {
+          console.error('Error creating profile:', insertError);
+          throw insertError;
+        }
         
-      } else if (error) {
-        throw error;
+        data = insertData;
+      } else if (fetchError) {
+        console.error('Error fetching profile:', fetchError);
+        throw fetchError;
       }
-      // END CRITICAL FIX
 
       if (data) {
         const userProfile: User = {
@@ -109,87 +132,103 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           collegeName: data.college_name || undefined,
           karmaPoints: data.karma_points,
           isAnonymous: data.is_anonymous,
-          badges: data.badges as any[],
+          badges: data.badges || [],
           dailyMessageCount: data.daily_message_count,
         };
 
         setUser(userProfile);
         setUserMode(data.is_anonymous ? 'anonymous' : 'verified');
+        setError(null);
       }
-    } catch (error) {
-      console.error('Error loading user profile:', error);
+    } catch (err) {
+      console.error('Error loading user profile:', err);
+      setError('Failed to load profile');
     }
   };
 
   const enterAnonymous = async () => {
+    setError(null);
+    setLoading(true);
+
     try {
-      // Sign in anonymously
       const { data: authData, error: authError } = await supabase.auth.signInAnonymously();
-      if (authError) throw authError;
-
-      if (authData.user) {
-        // Create user profile
-        const anonymousUser = {
-          id: authData.user.id,
-          username: generateAnonymousUsername(),
-          is_verified: false,
-          gender: 'unspecified',
-          karma_points: 0,
-          is_anonymous: true,
-          badges: [],
-          daily_message_count: 0,
-        };
-
-        const { error: insertError } = await supabase
-          .from('users')
-          .insert(anonymousUser);
-
-        if (insertError) throw insertError;
-
-        // Use loadUserProfile to load the newly created anonymous profile
-        await loadUserProfile(authData.user.id);
+      
+      if (authError) {
+        throw new Error(`Anonymous sign-in failed: ${authError.message}`);
       }
-    } catch (error) {
-      console.error('Error entering anonymous:', error);
-      throw error;
+
+      if (!authData.user) {
+        throw new Error('No user returned from anonymous sign-in');
+      }
+
+      // Profile creation is now handled by database trigger or loadUserProfile
+      await loadUserProfile(authData.user.id, authData.user);
+      
+    } catch (err: any) {
+      console.error('Error entering anonymous:', err);
+      setError(err.message || 'Failed to enter anonymously');
+      throw err;
+    } finally {
+      setLoading(false);
     }
   };
 
   const login = async (email: string, gender: Gender) => {
+    setError(null);
+    setLoading(true);
+
     try {
-      // For MVP, use magic link authentication
+      // Validate email first
+      const validation = validateCollegeEmail(email);
+      if (!validation.isValid) {
+        throw new Error(validation.error || 'Invalid email');
+      }
+
+      // Send magic link
       const { error: signInError } = await supabase.auth.signInWithOtp({
-        email,
+        email: validation.email!,
         options: {
           emailRedirectTo: window.location.origin,
+          data: {
+            gender,
+            college_name: validation.collegeName,
+          },
         },
       });
 
-      if (signInError) throw signInError;
+      if (signInError) {
+        throw new Error(`Login failed: ${signInError.message}`);
+      }
 
-      // After email verification, profile creation/update is handled by auth state change listener (loadUserProfile)
-      alert('Check your email for the verification link!');
+      // Success - user will receive email
+      setError(null);
       
-      // NOTE: We should also update the user's gender here if the profile exists, 
-      // but for simplicity, we rely on the redirect and the user to update their profile later 
-      // if the gender input was used only for initial sign-up context.
-      
-    } catch (error) {
-      console.error('Error logging in:', error);
-      throw error;
+    } catch (err: any) {
+      console.error('Error logging in:', err);
+      setError(err.message || 'Failed to send verification email');
+      throw err;
+    } finally {
+      setLoading(false);
     }
   };
 
   const logout = async () => {
+    setError(null);
+
     try {
-      const { error } = await supabase.auth.signOut();
-      if (error) throw error;
+      const { error: signOutError } = await supabase.auth.signOut();
+      
+      if (signOutError) {
+        throw new Error(`Logout failed: ${signOutError.message}`);
+      }
 
       setUser(null);
       setUserMode('anonymous');
-    } catch (error) {
-      console.error('Error logging out:', error);
-      throw error;
+      
+    } catch (err: any) {
+      console.error('Error logging out:', err);
+      setError(err.message || 'Failed to logout');
+      throw err;
     }
   };
 
@@ -199,22 +238,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const newKarmaPoints = user.karmaPoints + points;
 
-      const { error } = await supabase
+      const { error: updateError } = await supabase
         .from('users')
         .update({ karma_points: newKarmaPoints })
         .eq('id', user.id);
 
-      if (error) throw error;
+      if (updateError) {
+        console.error('Error updating karma:', updateError);
+        return;
+      }
 
       setUser({ ...user, karmaPoints: newKarmaPoints });
-    } catch (error) {
-      console.error('Error updating karma:', error);
+      
+    } catch (err) {
+      console.error('Error updating karma:', err);
     }
   };
 
   const incrementMessageCount = async (): Promise<boolean> => {
     if (!user) return false;
 
+    // Check limit for anonymous users
     if (user.isAnonymous && user.dailyMessageCount >= 50) {
       return false;
     }
@@ -222,41 +266,51 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const newCount = user.dailyMessageCount + 1;
 
-      const { error } = await supabase
+      const { error: updateError } = await supabase
         .from('users')
         .update({ daily_message_count: newCount })
         .eq('id', user.id);
 
-      if (error) throw error;
+      if (updateError) {
+        console.error('Error incrementing message count:', updateError);
+        return false;
+      }
 
       setUser({ ...user, dailyMessageCount: newCount });
       return true;
-    } catch (error) {
-      console.error('Error incrementing message count:', error);
+      
+    } catch (err) {
+      console.error('Error incrementing message count:', err);
       return false;
     }
   };
 
   const refreshUser = async () => {
     if (user) {
-      // Reload the user profile without requiring authUser from session
-      await loadUserProfile(user.id); 
+      await loadUserProfile(user.id);
     }
+  };
+
+  const clearError = () => {
+    setError(null);
   };
 
   return (
     <AuthContext.Provider value={{
       user,
       userMode,
-      loading,
+      loading, // Pass loading state
+      error,
       login,
       logout,
       enterAnonymous,
       updateKarma,
       incrementMessageCount,
       refreshUser,
+      clearError,
     }}>
-      {!loading && children}
+      {/* ALWAYS render children. Loading state check is moved to AppContent. */}
+      {children}
     </AuthContext.Provider>
   );
 }

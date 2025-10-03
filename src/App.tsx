@@ -11,8 +11,17 @@ import Navigation from './components/Navigation';
 type Tab = 'mega' | 'rooms' | 'onetoone' | 'leaderboard' | 'profile';
 
 function AppContent() {
-  const { user } = useAuth();
+  const { user, loading } = useAuth(); // <-- Get loading state
   const [activeTab, setActiveTab] = useState<Tab>('mega');
+
+  // FIX: Render a loading screen while auth is checking the session
+  if (loading) {
+    return (
+        <div className="h-screen flex items-center justify-center bg-slate-900">
+            <div className="text-white text-xl font-bold">Loading CampusChat...</div>
+        </div>
+    );
+  }
 
   if (!user) {
     return <WelcomeScreen />;

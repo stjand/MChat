@@ -1,11 +1,25 @@
 import { useState, useEffect, useRef } from 'react';
 import { Users, Send, ArrowLeft, RotateCcw, Sparkles } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { getRandomIcebreaker } from '../utils/username';
+import { supabase } from '../lib/supabase';
 import { Message } from '../types';
-import { MatchmakingService } from '../services/matchmaking'; // <-- NEW
+import { MatchmakingService } from '../services/matchmaking';
 
 type RoomSize = 2 | 3 | 4;
+
+// Supabase row type for joined messages (users comes back as array)
+type MessageRow = {
+  id: string;
+  user_id: string;
+  content: string;
+  reactions: any;
+  is_pinned: boolean;
+  created_at: string;
+  users: {
+    username: string;
+    is_verified: boolean;
+  }[];
+};
 
 export default function SmallRooms() {
   const { user, updateKarma, incrementMessageCount } = useAuth();
@@ -16,22 +30,100 @@ export default function SmallRooms() {
   const [icebreaker, setIcebreaker] = useState('');
   const [participants, setParticipants] = useState<string[]>([]);
   const [isMatching, setIsMatching] = useState(false);
-  const [roomId, setRoomId] = useState<string | null>(null); // <-- NEW: State to hold the current room ID
+  const [roomId, setRoomId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const realtimeChannel = useRef<any>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Cleanup for unmount or component state change
   useEffect(() => {
     return () => {
-      // Cancel matchmaking if component unmounts while matching
       if (user && isMatching) {
         MatchmakingService.cancelMatching(user.id);
       }
+      if (realtimeChannel.current) {
+        supabase.removeChannel(realtimeChannel.current);
+      }
     };
   }, [user, isMatching]);
+
+  const loadRoomMessages = async (currentRoomId: string) => {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select(`
+        id, user_id, content, reactions, is_pinned, created_at,
+        users!inner (username, is_verified)
+      `)
+      .eq('room_id', currentRoomId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    const formattedMessages: Message[] = (data || [])
+      .filter((msg: any) => msg.users)
+      .map((msg: any) => ({
+        id: msg.id,
+        userId: msg.user_id,
+        username: msg.users.username,
+        content: msg.content,
+        isVerifiedAuthor: msg.users.is_verified,
+        reactions: msg.reactions,
+        isPinned: msg.is_pinned,
+        createdAt: new Date(msg.created_at),
+      }));
+
+    setMessages(formattedMessages);
+  } catch (error) {
+    console.error('Error loading room messages:', error);
+  }
+};
+
+const subscribeToRoom = (currentRoomId: string) => {
+  if (realtimeChannel.current) {
+    supabase.removeChannel(realtimeChannel.current);
+  }
+
+  realtimeChannel.current = supabase
+    .channel(`room:${currentRoomId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages',
+        filter: `room_id=eq.${currentRoomId}`,
+      },
+      async (payload) => {
+        const { data, error } = await supabase
+          .from('messages')
+          .select(`
+            id, user_id, content, reactions, is_pinned, created_at,
+            users!inner (username, is_verified)
+          `)
+          .eq('id', payload.new.id)
+          .single();
+
+        if (!error && data) {
+          const newMsg: Message = {
+            id: data.id,
+            userId: data.user_id,
+            username: (data as any).users.username,
+            content: data.content,
+            isVerifiedAuthor: (data as any).users.is_verified,
+            reactions: data.reactions,
+            isPinned: data.is_pinned,
+            createdAt: new Date(data.created_at),
+          };
+
+          setMessages((prev) => [...prev, newMsg]);
+        }
+      }
+    )
+    .subscribe();
+};
 
   const startMatching = async (size: RoomSize) => {
     if (!user) return;
@@ -40,7 +132,6 @@ export default function SmallRooms() {
     setIsMatching(true);
 
     try {
-      // Real Matchmaking Service Call
       const matchResult = await MatchmakingService.findMatch({
         userId: user.id,
         roomSize: size,
@@ -53,18 +144,8 @@ export default function SmallRooms() {
       setIcebreaker(matchResult.icebreaker);
       setInRoom(true);
 
-      const welcomeMessage: Message = {
-        id: 'welcome',
-        userId: 'system',
-        username: 'System',
-        content: `${matchResult.participants.length} strangers have been matched! Icebreaker: ${matchResult.icebreaker}`,
-        isVerifiedAuthor: false,
-        reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-        isPinned: false,
-        createdAt: new Date(),
-      };
-      setMessages([welcomeMessage]);
-
+      await loadRoomMessages(matchResult.roomId);
+      subscribeToRoom(matchResult.roomId);
     } catch (error) {
       console.error('Matching failed:', error);
       alert('Matching failed or timed out. Please try again.');
@@ -73,76 +154,51 @@ export default function SmallRooms() {
     }
   };
 
-  const handleSendMessage = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newMessage.trim() || !user) return;
+  const handleSendMessage = async (e: React.FormEvent) => {
+  e.preventDefault();
+  if (!newMessage.trim() || !user || !roomId) return;
 
-    // Check message limit (real logic via AuthContext)
-    if (!incrementMessageCount()) {
-      alert('Daily message limit reached! Get verified for unlimited messages.');
-      return;
-    }
+  const canSend = await incrementMessageCount();
+  if (!canSend) {
+    alert('Daily message limit reached!');
+    return;
+  }
 
-    const message: Message = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      username: user.username,
+  try {
+    const { error } = await supabase.from('messages').insert({
+      user_id: user.id,
+      room_id: roomId,
       content: newMessage,
-      isVerifiedAuthor: user.isVerified,
+      is_mega_chat: false,
       reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-      isPinned: false,
-      createdAt: new Date(),
-    };
+      is_pinned: false,
+    });
 
-    setMessages([...messages, message]);
+    if (error) throw error;
+
     setNewMessage('');
-    updateKarma(1);
-
-    // Mock bot response (This remains until full Supabase rooms are implemented)
-    setTimeout(() => {
-      const nonCurrentUserParticipants = participants.filter(p => p !== user.username); 
-      const randomParticipant = nonCurrentUserParticipants.length > 0 
-        ? nonCurrentUserParticipants[Math.floor(Math.random() * nonCurrentUserParticipants.length)]
-        : 'Stranger';
-
-      const responses = [
-        'haha that\'s wild',
-        'no way! same here',
-        'interesting take 🤔',
-        'anyone else agree?',
-        'okay but hear me out...',
-        'facts 💯',
-        'i\'m dead 😂',
-        'this conversation is gold',
-      ];
-
-      const botMessage: Message = {
-        id: crypto.randomUUID(),
-        userId: 'bot',
-        username: randomParticipant,
-        content: responses[Math.floor(Math.random() * responses.length)],
-        isVerifiedAuthor: false,
-        reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-        isPinned: false,
-        createdAt: new Date(),
-      };
-
-      setMessages(prev => [...prev, botMessage]);
-    }, 1500 + Math.random() * 2000);
-  };
+    await updateKarma(1);
+  } catch (error) {
+    console.error('Error sending message:', error);
+  }
+};
 
   const leaveRoom = async () => {
-    // 1. Handle Matching Cancellation
     if (isMatching && user) {
-        MatchmakingService.cancelMatching(user.id);
+      MatchmakingService.cancelMatching(user.id);
     }
 
-    // 2. Real Room Leave/Cleanup
     if (user && roomId) {
-      await MatchmakingService.leaveRoom(roomId, user.id);
+      try {
+        await MatchmakingService.leaveRoom(roomId, user.id);
+      } catch (error) {
+        console.error('Error leaving room:', error);
+      }
     }
-    
-    // 3. Reset local state
+
+    const oldChannel = realtimeChannel.current;
+    realtimeChannel.current = null;
+
     setInRoom(false);
     setMessages([]);
     setParticipants([]);
@@ -150,15 +206,21 @@ export default function SmallRooms() {
     setIcebreaker('');
     setRoomId(null);
     setIsMatching(false);
+
+    if (oldChannel) {
+      setTimeout(() => {
+        supabase.removeChannel(oldChannel);
+      }, 100);
+    }
   };
 
   const skipToNextRoom = () => {
     if (roomSize) {
-      leaveRoom(); // Leave current room/cancel matching
+      leaveRoom();
       setTimeout(() => startMatching(roomSize), 100);
     }
   };
-  
+
   if (isMatching) {
     return (
       <div className="flex flex-col items-center justify-center h-full bg-slate-900 p-8">
@@ -170,9 +232,7 @@ export default function SmallRooms() {
           <h2 className="text-2xl font-bold text-white mb-2">
             Finding {roomSize} strangers...
           </h2>
-          <p className="text-slate-400">
-            Matching you with cool people
-          </p>
+          <p className="text-slate-400">Matching you with cool people</p>
         </div>
       </div>
     );
@@ -222,12 +282,10 @@ export default function SmallRooms() {
               className={`${
                 message.userId === user?.id
                   ? 'ml-auto bg-blue-500'
-                  : message.userId === 'system'
-                  ? 'bg-slate-700 text-center'
                   : 'mr-auto bg-slate-800'
               } max-w-[80%] rounded-2xl p-3`}
             >
-              {message.userId !== user?.id && message.userId !== 'system' && (
+              {message.userId !== user?.id && (
                 <p className="text-xs font-semibold text-slate-400 mb-1">
                   {message.username}
                 </p>
@@ -238,7 +296,10 @@ export default function SmallRooms() {
           <div ref={messagesEndRef} />
         </div>
 
-        <form onSubmit={handleSendMessage} className="p-4 bg-slate-800 border-t border-slate-700">
+        <form
+          onSubmit={handleSendMessage}
+          className="p-4 bg-slate-800 border-t border-slate-700"
+        >
           <div className="flex gap-2">
             <input
               type="text"
@@ -305,7 +366,7 @@ export default function SmallRooms() {
         {user?.isVerified && (
           <div className="mt-6 bg-emerald-900/20 border border-emerald-700/50 rounded-lg p-4 text-center">
             <p className="text-sm text-emerald-300">
-              ✅ Verified users get priority matching
+              Verified users get priority matching
             </p>
           </div>
         )}
