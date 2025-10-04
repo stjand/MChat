@@ -7,20 +7,6 @@ import { MatchmakingService } from '../services/matchmaking';
 
 type RoomSize = 2 | 3 | 4;
 
-// Supabase row type for joined messages (users comes back as array)
-type MessageRow = {
-  id: string;
-  user_id: string;
-  content: string;
-  reactions: any;
-  is_pinned: boolean;
-  created_at: string;
-  users: {
-    username: string;
-    is_verified: boolean;
-  }[];
-};
-
 export default function SmallRooms() {
   const { user, updateKarma, incrementMessageCount } = useAuth();
   const [roomSize, setRoomSize] = useState<RoomSize | null>(null);
@@ -31,6 +17,7 @@ export default function SmallRooms() {
   const [participants, setParticipants] = useState<string[]>([]);
   const [isMatching, setIsMatching] = useState(false);
   const [roomId, setRoomId] = useState<string | null>(null);
+  const [matchError, setMatchError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const realtimeChannel = useRef<any>(null);
 
@@ -38,98 +25,106 @@ export default function SmallRooms() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  useEffect(() => {
-    return () => {
-      if (user && isMatching) {
-        MatchmakingService.cancelMatching(user.id);
-      }
-      if (realtimeChannel.current) {
-        supabase.removeChannel(realtimeChannel.current);
-      }
-    };
-  }, [user, isMatching]);
+  // In SmallRooms.tsx and OneToOne.tsx, improve cleanup:
+useEffect(() => {
+  return () => {
+    if (user) {
+      MatchmakingService.cancelMatching(user.id);
+    }
+    if (realtimeChannel.current) {
+      supabase.removeChannel(realtimeChannel.current);
+    }
+  };
+}, [user?.id]); // ✅ Add dependency
 
   const loadRoomMessages = async (currentRoomId: string) => {
-  try {
-    const { data, error } = await supabase
-      .from('messages')
-      .select(`
-        id, user_id, content, reactions, is_pinned, created_at,
-        users!inner (username, is_verified)
-      `)
-      .eq('room_id', currentRoomId)
-      .order('created_at', { ascending: true });
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .select(`
+  id, user_id, content, reactions, is_pinned, created_at,
+  users (username, is_verified)
+`)
+        .eq('room_id', currentRoomId)
+        .order('created_at', { ascending: true });
 
-    if (error) throw error;
+      if (error) throw error;
 
-    const formattedMessages: Message[] = (data || [])
-      .filter((msg: any) => msg.users)
-      .map((msg: any) => ({
-        id: msg.id,
-        userId: msg.user_id,
-        username: msg.users.username,
-        content: msg.content,
-        isVerifiedAuthor: msg.users.is_verified,
-        reactions: msg.reactions,
-        isPinned: msg.is_pinned,
-        createdAt: new Date(msg.created_at),
-      }));
+      const formattedMessages: Message[] = (data || [])
+        .filter((msg: any) => msg.users)
+        .map((msg: any) => ({
+          id: msg.id,
+          userId: msg.user_id,
+          username: msg.users.username,
+          content: msg.content,
+          isVerifiedAuthor: msg.users.is_verified,
+          reactions: msg.reactions || { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+          isPinned: msg.is_pinned || false,
+          createdAt: new Date(msg.created_at),
+        }));
 
-    setMessages(formattedMessages);
-  } catch (error) {
-    console.error('Error loading room messages:', error);
-  }
-};
+      setMessages(formattedMessages);
+    } catch (error) {
+      console.error('Error loading room messages:', error);
+    }
+  };
 
-const subscribeToRoom = (currentRoomId: string) => {
-  if (realtimeChannel.current) {
-    supabase.removeChannel(realtimeChannel.current);
-  }
+  const subscribeToRoom = (currentRoomId: string) => {
+    if (realtimeChannel.current) {
+      supabase.removeChannel(realtimeChannel.current);
+    }
 
-  realtimeChannel.current = supabase
-    .channel(`room:${currentRoomId}`)
-    .on(
-      'postgres_changes',
-      {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'messages',
-        filter: `room_id=eq.${currentRoomId}`,
-      },
-      async (payload) => {
-        const { data, error } = await supabase
-          .from('messages')
-          .select(`
-            id, user_id, content, reactions, is_pinned, created_at,
-            users!inner (username, is_verified)
-          `)
-          .eq('id', payload.new.id)
-          .single();
+    realtimeChannel.current = supabase
+      .channel(`room:${currentRoomId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: `room_id=eq.${currentRoomId}`,
+        },
+        async (payload) => {
+          try {
+            const { data, error } = await supabase
+              .from('messages')
+              .select(`
+  id, user_id, content, reactions, is_pinned, created_at,
+  users (username, is_verified)
+`)
+              .eq('id', payload.new.id)
+              .single();
 
-        if (!error && data) {
-          const newMsg: Message = {
-            id: data.id,
-            userId: data.user_id,
-            username: (data as any).users.username,
-            content: data.content,
-            isVerifiedAuthor: (data as any).users.is_verified,
-            reactions: data.reactions,
-            isPinned: data.is_pinned,
-            createdAt: new Date(data.created_at),
-          };
+            if (!error && data) {
+              const newMsg: Message = {
+                id: data.id,
+                userId: data.user_id,
+                username: (data as any).users.username,
+                content: data.content,
+                isVerifiedAuthor: (data as any).users.is_verified,
+                reactions: data.reactions || { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+                isPinned: data.is_pinned || false,
+                createdAt: new Date(data.created_at),
+              };
 
-          setMessages((prev) => [...prev, newMsg]);
+              setMessages((prev) => [...prev, newMsg]);
+            }
+          } catch (error) {
+            console.error('Error handling new message:', error);
+          }
         }
-      }
-    )
-    .subscribe();
-};
+      )
+      .subscribe((status) => {
+        console.log('Room subscription status:', status);
+      });
+  };
 
   const startMatching = async (size: RoomSize) => {
     if (!user) return;
 
     setRoomSize(size);
     setIsMatching(true);
+    setMatchError(null);
 
     try {
       const matchResult = await MatchmakingService.findMatch({
@@ -146,42 +141,43 @@ const subscribeToRoom = (currentRoomId: string) => {
 
       await loadRoomMessages(matchResult.roomId);
       subscribeToRoom(matchResult.roomId);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Matching failed:', error);
-      alert('Matching failed or timed out. Please try again.');
+      setMatchError(error.message || 'Matching failed. Please try again.');
     } finally {
       setIsMatching(false);
     }
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
-  e.preventDefault();
-  if (!newMessage.trim() || !user || !roomId) return;
+    e.preventDefault();
+    if (!newMessage.trim() || !user || !roomId) return;
 
-  const canSend = await incrementMessageCount();
-  if (!canSend) {
-    alert('Daily message limit reached!');
-    return;
-  }
+    const canSend = await incrementMessageCount();
+    if (!canSend) {
+      alert('Daily message limit reached!');
+      return;
+    }
 
-  try {
-    const { error } = await supabase.from('messages').insert({
-      user_id: user.id,
-      room_id: roomId,
-      content: newMessage,
-      is_mega_chat: false,
-      reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
-      is_pinned: false,
-    });
+    try {
+      const { error } = await supabase.from('messages').insert({
+        user_id: user.id,
+        room_id: roomId,
+        content: newMessage,
+        is_mega_chat: false,
+        reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+        is_pinned: false,
+      });
 
-    if (error) throw error;
+      if (error) throw error;
 
-    setNewMessage('');
-    await updateKarma(1);
-  } catch (error) {
-    console.error('Error sending message:', error);
-  }
-};
+      setNewMessage('');
+      await updateKarma(1);
+    } catch (error) {
+      console.error('Error sending message:', error);
+      alert('Failed to send message');
+    }
+  };
 
   const leaveRoom = async () => {
     if (isMatching && user) {
@@ -196,8 +192,10 @@ const subscribeToRoom = (currentRoomId: string) => {
       }
     }
 
-    const oldChannel = realtimeChannel.current;
-    realtimeChannel.current = null;
+    if (realtimeChannel.current) {
+      await supabase.removeChannel(realtimeChannel.current);
+      realtimeChannel.current = null;
+    }
 
     setInRoom(false);
     setMessages([]);
@@ -206,18 +204,13 @@ const subscribeToRoom = (currentRoomId: string) => {
     setIcebreaker('');
     setRoomId(null);
     setIsMatching(false);
-
-    if (oldChannel) {
-      setTimeout(() => {
-        supabase.removeChannel(oldChannel);
-      }, 100);
-    }
+    setMatchError(null);
   };
 
   const skipToNextRoom = () => {
     if (roomSize) {
       leaveRoom();
-      setTimeout(() => startMatching(roomSize), 100);
+      setTimeout(() => startMatching(roomSize), 500);
     }
   };
 
@@ -232,7 +225,36 @@ const subscribeToRoom = (currentRoomId: string) => {
           <h2 className="text-2xl font-bold text-white mb-2">
             Finding {roomSize} strangers...
           </h2>
-          <p className="text-slate-400">Matching you with cool people</p>
+          <p className="text-slate-400 mb-4">Matching you with cool people</p>
+          <button
+            onClick={leaveRoom}
+            className="px-6 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (matchError) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-slate-900 p-8">
+        <div className="text-center max-w-md">
+          <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">⚠️</span>
+          </div>
+          <h2 className="text-2xl font-bold text-white mb-2">Matching Failed</h2>
+          <p className="text-slate-400 mb-6">{matchError}</p>
+          <button
+            onClick={() => {
+              setMatchError(null);
+              setRoomSize(null);
+            }}
+            className="px-8 py-3 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-lg transition-colors"
+          >
+            Try Again
+          </button>
         </div>
       </div>
     );
@@ -310,7 +332,8 @@ const subscribeToRoom = (currentRoomId: string) => {
             />
             <button
               type="submit"
-              className="px-6 py-3 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-lg transition-colors"
+              disabled={!newMessage.trim()}
+              className="px-6 py-3 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-600 text-white font-semibold rounded-lg transition-colors"
             >
               <Send className="w-4 h-4" />
             </button>

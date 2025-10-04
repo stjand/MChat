@@ -16,6 +16,7 @@ export default function OneToOne() {
   const [showIdentity, setShowIdentity] = useState(false);
   const [timer, setTimer] = useState(180);
   const [roomId, setRoomId] = useState<string | null>(null);
+  const [matchError, setMatchError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const realtimeChannel = useRef<any>(null);
 
@@ -40,22 +41,26 @@ export default function OneToOne() {
     }
   }, [inChat, showIdentity]);
 
-  useEffect(() => {
-    return () => {
-      if (realtimeChannel.current) {
-        supabase.removeChannel(realtimeChannel.current);
-      }
-    };
-  }, []);
+  // In SmallRooms.tsx and OneToOne.tsx, improve cleanup:
+useEffect(() => {
+  return () => {
+    if (user) {
+      MatchmakingService.cancelMatching(user.id);
+    }
+    if (realtimeChannel.current) {
+      supabase.removeChannel(realtimeChannel.current);
+    }
+  };
+}, [user?.id]); // ✅ Add dependency
 
   const loadRoomMessages = async (currentRoomId: string) => {
     try {
       const { data, error } = await supabase
         .from('messages')
         .select(`
-          id, user_id, content, reactions, is_pinned, created_at,
-          users (username, is_verified)
-        `)
+  id, user_id, content, reactions, is_pinned, created_at,
+  users (username, is_verified)
+`)
         .eq('room_id', currentRoomId)
         .order('created_at', { ascending: true });
 
@@ -69,8 +74,8 @@ export default function OneToOne() {
           username: msg.users.username,
           content: msg.content,
           isVerifiedAuthor: msg.users.is_verified,
-          reactions: msg.reactions,
-          isPinned: msg.is_pinned,
+          reactions: msg.reactions || { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+          isPinned: msg.is_pinned || false,
           createdAt: new Date(msg.created_at),
         }));
 
@@ -96,38 +101,45 @@ export default function OneToOne() {
           filter: `room_id=eq.${currentRoomId}`,
         },
         async (payload) => {
-          const { data, error } = await supabase
-            .from('messages')
-            .select(`
-              id, user_id, content, reactions, is_pinned, created_at,
-              users (username, is_verified)
-            `)
-            .eq('id', payload.new.id)
-            .single();
+          try {
+            const { data, error } = await supabase
+              .from('messages')
+              .select(`
+                id, user_id, content, reactions, is_pinned, created_at,
+                users!inner (username, is_verified)
+              `)
+              .eq('id', payload.new.id)
+              .single();
 
-          if (!error && data && (data as any).users) {
-            const newMsg: Message = {
-              id: data.id,
-              userId: data.user_id,
-              username: (data as any).users.username,
-              content: data.content,
-              isVerifiedAuthor: (data as any).users.is_verified,
-              reactions: data.reactions,
-              isPinned: data.is_pinned,
-              createdAt: new Date(data.created_at),
-            };
+            if (!error && data) {
+              const newMsg: Message = {
+                id: data.id,
+                userId: data.user_id,
+                username: (data as any).users.username,
+                content: data.content,
+                isVerifiedAuthor: (data as any).users.is_verified,
+                reactions: data.reactions || { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+                isPinned: data.is_pinned || false,
+                createdAt: new Date(data.created_at),
+              };
 
-            setMessages((prev) => [...prev, newMsg]);
+              setMessages((prev) => [...prev, newMsg]);
+            }
+          } catch (error) {
+            console.error('Error handling new message:', error);
           }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        console.log('Room subscription status:', status);
+      });
   };
 
   const startMatching = async () => {
     if (!user) return;
 
     setIsMatching(true);
+    setMatchError(null);
 
     try {
       let matchResult;
@@ -154,12 +166,11 @@ export default function OneToOne() {
       setTimer(180);
       setShowIdentity(false);
 
-      // Load messages and subscribe to room
       await loadRoomMessages(matchResult.roomId);
       subscribeToRoom(matchResult.roomId);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Matching failed:', error);
-      alert('Matching failed or timed out. Please try again.');
+      setMatchError(error.message || 'Matching failed. Please try again.');
     } finally {
       setIsMatching(false);
     }
@@ -214,11 +225,17 @@ export default function OneToOne() {
     setStrangerName('');
     setIcebreaker('');
     setRoomId(null);
+    setShowIdentity(false);
+    setMatchError(null);
 
-    setTimeout(() => startMatching(), 100);
+    setTimeout(() => startMatching(), 500);
   };
 
   const endChat = async () => {
+    if (isMatching && user) {
+      MatchmakingService.cancelMatching(user.id);
+    }
+
     if (realtimeChannel.current) {
       await supabase.removeChannel(realtimeChannel.current);
       realtimeChannel.current = null;
@@ -238,6 +255,8 @@ export default function OneToOne() {
     setIcebreaker('');
     setShowIdentity(false);
     setRoomId(null);
+    setIsMatching(false);
+    setMatchError(null);
   };
 
   const formatTime = (seconds: number) => {
@@ -257,11 +276,37 @@ export default function OneToOne() {
           <h2 className="text-2xl font-bold text-white mb-2">
             Finding you a match...
           </h2>
-          <p className="text-slate-400">
+          <p className="text-slate-400 mb-4">
             {user?.isVerified && user.gender !== 'unspecified'
               ? 'Matching with opposite-gender verified student'
               : 'Connecting with a random stranger'}
           </p>
+          <button
+            onClick={endChat}
+            className="px-6 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (matchError) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-slate-900 p-8">
+        <div className="text-center max-w-md">
+          <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">⚠️</span>
+          </div>
+          <h2 className="text-2xl font-bold text-white mb-2">Matching Failed</h2>
+          <p className="text-slate-400 mb-6">{matchError}</p>
+          <button
+            onClick={() => setMatchError(null)}
+            className="px-8 py-3 bg-pink-500 hover:bg-pink-600 text-white font-semibold rounded-lg transition-colors"
+          >
+            Try Again
+          </button>
         </div>
       </div>
     );
@@ -350,7 +395,8 @@ export default function OneToOne() {
             />
             <button
               type="submit"
-              className="px-6 py-3 bg-pink-500 hover:bg-pink-600 text-white font-semibold rounded-lg transition-colors"
+              disabled={!newMessage.trim()}
+              className="px-6 py-3 bg-pink-500 hover:bg-pink-600 disabled:bg-slate-600 text-white font-semibold rounded-lg transition-colors"
             >
               <Send className="w-4 h-4" />
             </button>

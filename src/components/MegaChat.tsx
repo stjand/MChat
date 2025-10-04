@@ -1,214 +1,268 @@
 // src/components/MegaChat.tsx
-import { useState, useEffect, useRef } from 'react';
-import { Send, Flame, Heart, Eye, Laugh, Pin, Flag } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
-import { supabase } from '../lib/supabase';
-import { Message } from '../types';
+import React, { useEffect, useRef, useState } from "react";
+import { Send, Flame, Heart, Eye, Laugh, Pin, Flag } from "lucide-react";
+import { useAuth } from "../context/AuthContext";
+import { supabase } from "../lib/supabase";
+import { Message } from "../types";
 
 interface DBMessage {
   id: string;
   user_id: string;
   content: string;
-  reactions: { fire: number; laugh: number; heart: number; eyes: number };
+  reactions: { fire: number; laugh: number; heart: number; eyes: number } | any;
   is_pinned: boolean;
   created_at: string;
-  users: {
-    username: string;
-    is_verified: boolean;
-  };
+  users: { username: string; is_verified: boolean } | { username: string; is_verified: boolean }[] | null;
+}
+
+const defaultReactions = { fire: 0, laugh: 0, heart: 0, eyes: 0 };
+
+function extractUser(users: DBMessage["users"]) {
+  if (!users) return { username: "unknown", is_verified: false };
+  return Array.isArray(users) ? users[0] ?? { username: "unknown", is_verified: false } : users;
 }
 
 export default function MegaChat() {
   const { user, updateKarma, incrementMessageCount } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
-  const [newMessage, setNewMessage] = useState('');
+  const [newMessage, setNewMessage] = useState("");
   const [loading, setLoading] = useState(true);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [sending, setSending] = useState(false);
+
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const isLoadingMessages = useRef(false);
   const realtimeChannel = useRef<any>(null);
+  const initialized = useRef(false);
 
-  useEffect(() => {
-    loadMessages();
-    subscribeToMessages();
-
-    return () => {
-      if (realtimeChannel.current) {
-        supabase.removeChannel(realtimeChannel.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
+  // ----- Load messages from Supabase -----
   const loadMessages = async () => {
+    if (isLoadingMessages.current) return;
+    isLoadingMessages.current = true;
+    setLoading(true);
+
     try {
       const { data, error } = await supabase
-        .from('messages')
-        .select(`
+        .from("messages")
+        .select(
+          `
           id,
           user_id,
           content,
           reactions,
           is_pinned,
           created_at,
-          users!inner (
+          users:users!inner (
             username,
             is_verified
           )
-        `)
-        .eq('is_mega_chat', true)
-        .order('created_at', { ascending: true })
-        .limit(100)
-        .returns<DBMessage[]>(); // ✅ explicitly typed
+        `
+        )
+        .eq("is_mega_chat", true)
+        .order("created_at", { ascending: true })
+        .limit(200);
 
       if (error) throw error;
 
-      const formattedMessages: Message[] = (data || [])
-        .filter((msg) => msg.users) // Filter out null users
-        .map((msg) => ({
-          id: msg.id,
-          userId: msg.user_id,
-          username: msg.users.is_verified ? `${msg.users.username} ✅` : msg.users.username,
-          content: msg.content,
-          isVerifiedAuthor: msg.users.is_verified,
-          reactions: msg.reactions,
-          isPinned: msg.is_pinned,
-          createdAt: new Date(msg.created_at),
-        }));
+      const formatted: Message[] = (data || [])
+        .filter((m: DBMessage) => !!m.users)
+        .map((m: DBMessage) => {
+          const u = extractUser(m.users);
+          return {
+            id: m.id,
+            userId: m.user_id,
+            username: u.is_verified ? `${u.username} ✅` : u.username,
+            content: m.content,
+            isVerifiedAuthor: !!u.is_verified,
+            reactions: m.reactions ?? defaultReactions,
+            isPinned: !!m.is_pinned,
+            createdAt: new Date(m.created_at),
+          } as Message;
+        });
 
-      setMessages(formattedMessages);
-    } catch (error) {
-      console.error('Error loading messages:', error);
+      setMessages(formatted);
+    } catch (err) {
+      console.error("Failed to load messages:", err);
     } finally {
       setLoading(false);
+      isLoadingMessages.current = false;
     }
   };
 
+  // ----- Realtime subscription -----
   const subscribeToMessages = () => {
+    if (!user) return () => {};
+
+    // Cleanup old channel
     if (realtimeChannel.current) {
-      supabase.removeChannel(realtimeChannel.current);
+      try {
+        supabase.removeChannel(realtimeChannel.current);
+      } catch (err) {
+        console.warn("Old channel removal failed:", err);
+      }
+      realtimeChannel.current = null;
     }
 
     realtimeChannel.current = supabase
-      .channel('mega_chat_messages')
+      .channel("mega_chat_messages")
       .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'messages',
-          filter: 'is_mega_chat=eq.true',
-        },
-        async (payload) => {
-          const { data, error } = await supabase
-            .from('messages')
-            .select(`
-              id,
-              user_id,
-              content,
-              reactions,
-              is_pinned,
-              created_at,
-              users (
-  username,
-  is_verified
-)
-            `)
-            .eq('id', payload.new.id)
-            .single<DBMessage>(); // ✅ typed
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "messages", filter: "is_mega_chat=eq.true" },
+        async (payload: any) => {
+          const insertedId = payload.new?.id;
+          if (!insertedId) return;
 
-          if (!error && data && data.users) {
-            const newMsg: Message = {
-              id: data.id,
-              userId: data.user_id,
-              username: data.users.is_verified ? `${data.users.username} ✅` : data.users.username,
-              content: data.content,
-              isVerifiedAuthor: data.users.is_verified,
-              reactions: data.reactions,
-              isPinned: data.is_pinned,
-              createdAt: new Date(data.created_at),
-            };
+          try {
+            const { data, error } = await supabase
+              .from("messages")
+              .select(`
+                id,
+                user_id,
+                content,
+                reactions,
+                is_pinned,
+                created_at,
+                users (
+                  username,
+                  is_verified
+                )
+              `)
+              .eq("id", insertedId)
+              .single<DBMessage>();
 
-            setMessages((prev) => [...prev, newMsg]);
+            if (!error && data && data.users) {
+              const u = extractUser(data.users);
+              const newMsg: Message = {
+                id: data.id,
+                userId: data.user_id,
+                username: u.is_verified ? `${u.username} ✅` : u.username,
+                content: data.content,
+                isVerifiedAuthor: !!u.is_verified,
+                reactions: data.reactions ?? defaultReactions,
+                isPinned: !!data.is_pinned,
+                createdAt: new Date(data.created_at),
+              };
+              setMessages((prev) => (prev.some((p) => p.id === newMsg.id) ? prev : [...prev, newMsg]));
+            }
+          } catch (err) {
+            console.error("Realtime INSERT handler error:", err);
           }
         }
       )
       .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'messages',
-          filter: 'is_mega_chat=eq.true',
-        },
-        (payload) => {
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "messages", filter: "is_mega_chat=eq.true" },
+        (payload: any) => {
+          const updated = payload.new;
+          if (!updated?.id) return;
           setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === payload.new.id
-                ? { ...msg, reactions: payload.new.reactions, isPinned: payload.new.is_pinned }
-                : msg
+            prev.map((m) =>
+              m.id === updated.id
+                ? { ...m, reactions: updated.reactions ?? m.reactions, isPinned: updated.is_pinned ?? m.isPinned }
+                : m
             )
           );
         }
       )
       .subscribe((status) => {
-        console.log('Realtime status:', status);
-        if (status === 'SUBSCRIBED') {
-          console.log('Successfully subscribed to mega chat');
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("Realtime channel disconnected, retrying in 2s...");
+          setTimeout(subscribeToMessages, 2000);
         }
       });
+
+    // Cleanup function
+    return () => {
+      if (realtimeChannel.current) {
+        supabase.removeChannel(realtimeChannel.current);
+        realtimeChannel.current = null;
+      }
+    };
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // ----- Auto-scroll -----
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // ----- Auto-resize textarea -----
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(200, ta.scrollHeight)}px`;
+  }, [newMessage]);
+
+  // ----- Initialize messages & subscription -----
+  useEffect(() => {
+    if (!user) return;
+
+    loadMessages();
+    const cleanup = subscribeToMessages();
+
+    return () => {
+      cleanup?.();
+      initialized.current = false; // Reset on unmount
+    };
+  }, [user?.id]);
+
+  // ----- Send message -----
+  const handleSendMessage = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     if (!newMessage.trim() || !user) return;
 
-    const canSend = await incrementMessageCount();
-    if (!canSend) {
-      alert('Daily message limit reached! Get verified for unlimited messages.');
-      return;
-    }
-
+    setSending(true);
     try {
-      const { data, error } = await supabase.from('messages').insert({
+      const canSend = await incrementMessageCount?.();
+      if (!canSend) {
+        alert("Daily message limit reached! Get verified for unlimited messages.");
+        setSending(false);
+        return;
+      }
+
+      const { error } = await supabase.from("messages").insert({
         user_id: user.id,
-        content: newMessage,
+        content: newMessage.trim(),
         is_mega_chat: true,
-        reactions: { fire: 0, laugh: 0, heart: 0, eyes: 0 },
+        reactions: defaultReactions,
         is_pinned: false,
-      }).select();
+      });
 
       if (error) throw error;
-
-      setNewMessage('');
-      await updateKarma(1);
-    } catch (error) {
-      console.error('Error sending message:', error);
-      alert('Failed to send message. Please try again.');
+      setNewMessage("");
+      await updateKarma?.(1);
+    } catch (err) {
+      console.error("send message failed:", err);
+      alert("Failed to send message. Please try again.");
+    } finally {
+      setSending(false);
     }
   };
 
-  const handleReaction = async (messageId: string, reactionType: keyof Message['reactions']) => {
+  const handleKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      if (!sending && newMessage.trim()) handleSendMessage();
+    }
+  };
+
+  const handleReaction = async (messageId: string, reaction: keyof Message["reactions"]) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId
+          ? { ...m, reactions: { ...(m.reactions ?? defaultReactions), [reaction]: (m.reactions?.[reaction] ?? 0) + 1 } }
+          : m
+      )
+    );
+
     try {
-      const message = messages.find((m) => m.id === messageId);
-      if (!message) return;
-
-      const updatedReactions = {
-        ...message.reactions,
-        [reactionType]: message.reactions[reactionType] + 1,
-      };
-
-      const { error } = await supabase
-        .from('messages')
-        .update({ reactions: updatedReactions })
-        .eq('id', messageId);
-
-      if (error) throw error;
-
-      await updateKarma(1);
-    } catch (error) {
-      console.error('Error adding reaction:', error);
+      const msg = messages.find((m) => m.id === messageId);
+      if (!msg) return;
+      const updatedReactions = { ...(msg.reactions ?? defaultReactions), [reaction]: (msg.reactions?.[reaction] ?? 0) + 1 };
+      const { error } = await supabase.from("messages").update({ reactions: updatedReactions }).eq("id", messageId);
+      if (!error) await updateKarma?.(1);
+    } catch (err) {
+      console.error("Failed to update reaction:", err);
     }
   };
 
@@ -217,126 +271,150 @@ export default function MegaChat() {
     const diff = now.getTime() - date.getTime();
     const minutes = Math.floor(diff / 60000);
     const hours = Math.floor(diff / 3600000);
-
-    if (minutes < 1) return 'just now';
-    if (minutes < 60) return `${minutes}m ago`;
-    if (hours < 24) return `${hours}h ago`;
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${minutes}m`;
+    if (hours < 24) return `${hours}h`;
     return date.toLocaleDateString();
   };
 
+  // ----- UI -----
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full bg-slate-900">
+      <div className="flex h-full items-center justify-center bg-black text-gray-300">
         <div className="text-center">
-          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p className="text-slate-400">Loading messages...</p>
+          <div className="w-10 h-10 border-4 border-white/10 border-t-white rounded-full animate-spin mx-auto mb-3" />
+          <div>Loading messages...</div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full bg-slate-900">
-      {/* Messages Container */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.map((message) => (
-          <div
-            key={message.id}
-            className={`rounded-xl p-4 transition-all backdrop-blur-sm ${
-              message.isPinned
-                ? 'bg-amber-900/30 border-2 border-amber-500/50 shadow-lg shadow-amber-500/10'
-                : message.isVerifiedAuthor
-                ? 'bg-emerald-900/20 border border-emerald-700/40'
-                : 'bg-slate-800/60 border border-slate-700/50'
-            }`}
-          >
-            <div className="flex items-start justify-between mb-2">
-              <div className="flex items-center gap-2">
-                <span className="font-semibold text-white text-sm">
-                  {message.username}
-                </span>
-                {message.isPinned && (
-                  <div className="flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 rounded-full">
-                    <Pin className="w-3 h-3 text-amber-400" />
-                    <span className="text-xs text-amber-300">Pinned</span>
+    <div className="flex flex-col h-full bg-black text-white">
+      {/* Header */}
+      <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
+        <div>
+          <h2 className="font-semibold text-lg">Mega Chat</h2>
+          <p className="text-xs text-white/50">Public room — be kind, be bold.</p>
+        </div>
+        <div className="text-xs text-white/40">Black & White theme</div>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-5 py-6 space-y-4">
+        {messages.length === 0 ? (
+          <div className="mt-10 flex flex-col items-center gap-2 text-white/60">
+            <div className="w-14 h-14 rounded-full bg-white/5 flex items-center justify-center">
+              <Send className="w-6 h-6" />
+            </div>
+            <div className="text-lg">No messages yet</div>
+            <div className="text-sm">Say hello — your messages appear on the right.</div>
+          </div>
+        ) : (
+          messages.map((m) => {
+            const isMine = m.userId === user?.id;
+            return (
+              <div key={m.id} className={`flex ${isMine ? "justify-end" : "justify-start"} px-2`}>
+                {!isMine && (
+                  <div className="mr-3">
+                    <div className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center text-sm font-medium">
+                      {m.username?.[0] ?? "U"}
+                    </div>
                   </div>
                 )}
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-slate-500">
-                  {formatTime(message.createdAt)}
-                </span>
-                <button className="text-slate-500 hover:text-slate-400 transition-colors">
-                  <Flag className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
 
-            <p className="text-slate-200 mb-3 leading-relaxed">{message.content}</p>
+                <div className="max-w-[78%]">
+                  <div className={`flex items-center gap-2 ${isMine ? "justify-end" : ""}`}>
+                    {!isMine && <div className="text-sm font-medium text-white/90">{m.username}</div>}
+                    {m.isPinned && (
+                      <div className="text-xs text-amber-300 flex items-center gap-1 bg-amber-400/5 px-2 py-0.5 rounded-full">
+                        <Pin className="w-3 h-3" />
+                        Pinned
+                      </div>
+                    )}
+                  </div>
 
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                onClick={() => handleReaction(message.id, 'fire')}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-700/50 hover:bg-orange-500/20 text-xs text-slate-300 hover:text-orange-400 transition-all hover:scale-105"
-              >
-                <Flame className="w-3.5 h-3.5" />
-                <span className="font-medium">{message.reactions.fire > 0 ? message.reactions.fire : ''}</span>
-              </button>
-              <button
-                onClick={() => handleReaction(message.id, 'laugh')}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-700/50 hover:bg-yellow-500/20 text-xs text-slate-300 hover:text-yellow-400 transition-all hover:scale-105"
-              >
-                <Laugh className="w-3.5 h-3.5" />
-                <span className="font-medium">{message.reactions.laugh > 0 ? message.reactions.laugh : ''}</span>
-              </button>
-              <button
-                onClick={() => handleReaction(message.id, 'heart')}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-700/50 hover:bg-pink-500/20 text-xs text-slate-300 hover:text-pink-400 transition-all hover:scale-105"
-              >
-                <Heart className="w-3.5 h-3.5" />
-                <span className="font-medium">{message.reactions.heart > 0 ? message.reactions.heart : ''}</span>
-              </button>
-              <button
-                onClick={() => handleReaction(message.id, 'eyes')}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-700/50 hover:bg-cyan-500/20 text-xs text-slate-300 hover:text-cyan-400 transition-all hover:scale-105"
-              >
-                <Eye className="w-3.5 h-3.5" />
-                <span className="font-medium">{message.reactions.eyes > 0 ? message.reactions.eyes : ''}</span>
-              </button>
-            </div>
-          </div>
-        ))}
+                  <div
+                    className={`mt-1 rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
+                      isMine
+                        ? "bg-white text-black rounded-br-none shadow-white/5"
+                        : "bg-white/5 text-white rounded-bl-none"
+                    }`}
+                    style={{ wordBreak: "break-word" }}
+                  >
+                    <div className="whitespace-pre-wrap">{m.content}</div>
+                  </div>
+
+                  <div className={`mt-2 flex items-center gap-3 text-xs ${isMine ? "justify-end" : ""}`}>
+                    <div className="text-white/50">{formatTime(new Date(m.createdAt))}</div>
+                    <button className="p-1 rounded hover:bg-white/5">
+                      <Flag className="w-4 h-4 text-white/60" />
+                    </button>
+
+                    <div className="flex items-center gap-2">
+                      {(
+                        [
+                          { Icon: Flame, key: "fire" },
+                          { Icon: Laugh, key: "laugh" },
+                          { Icon: Heart, key: "heart" },
+                          { Icon: Eye, key: "eyes" },
+                        ] as const
+                      ).map(({ Icon, key }) => {
+                        const count = (m.reactions as any)?.[key] ?? 0;
+                        return (
+                          <button
+                            key={key}
+                            onClick={() => handleReaction(m.id, key as keyof Message["reactions"])}
+                            className="flex items-center gap-1 px-2 py-1 rounded-full bg-white/3 hover:bg-white/8 text-xs"
+                          >
+                            <Icon className="w-4 h-4" />
+                            {count > 0 && <span className="text-xs">{count}</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                {isMine && <div className="ml-3 w-10" />}
+              </div>
+            );
+          })
+        )}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Message Input */}
-      <form onSubmit={handleSendMessage} className="p-4 bg-slate-800/95 backdrop-blur-sm border-t border-slate-700/50">
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={newMessage}
-            onChange={(e) => setNewMessage(e.target.value)}
-            placeholder={user?.isAnonymous ? `${50 - (user?.dailyMessageCount || 0)} messages left today...` : 'Share your thoughts...'}
-            className="flex-1 px-4 py-3 bg-slate-900/80 border border-slate-600/50 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-transparent transition-all"
-            maxLength={500}
-          />
-          <button
-            type="submit"
-            disabled={!newMessage.trim()}
-            className="px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:from-slate-600 disabled:to-slate-600 text-white font-semibold rounded-xl transition-all flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Send className="w-4 h-4" />
-          </button>
-        </div>
-        <div className="flex items-center justify-between mt-2 px-1">
-          <p className="text-xs text-slate-500">
-            {newMessage.length}/500 characters
-          </p>
-          {user?.isAnonymous && (
-            <p className="text-xs text-amber-400 font-medium">
-              Get verified for unlimited messages
-            </p>
-          )}
+      {/* Message input */}
+      <form onSubmit={handleSendMessage} className="p-4 border-t border-white/5 bg-black/95">
+        <div className="max-w-4xl mx-auto flex items-end gap-3">
+          <div className="flex-1">
+            <textarea
+              ref={textareaRef}
+              value={newMessage}
+              onChange={(e) => setNewMessage(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={user?.isAnonymous ? `${50 - (user?.dailyMessageCount || 0)} messages left today...` : "Write a message — Enter to send, Shift+Enter for newline"}
+              className="w-full min-h-[44px] max-h-[200px] resize-none bg-white/5 placeholder-white/40 text-white px-4 py-3 rounded-xl focus:outline-none focus:ring-1 focus:ring-white/10"
+              maxLength={500}
+              aria-label="Write a message"
+            />
+            <div className="flex justify-between text-xs text-white/40 mt-1">
+              <div>{newMessage.length}/500</div>
+              {user?.isAnonymous ? <div className="text-amber-400">Get verified for unlimited messages</div> : <div />}
+            </div>
+          </div>
+
+          <div className="flex flex-col items-center gap-2">
+            <button
+              type="submit"
+              disabled={!newMessage.trim() || sending}
+              className={`p-3 rounded-full transition-transform ${!newMessage.trim() || sending ? "bg-white/10 cursor-not-allowed" : "bg-white text-black hover:scale-105"}`}
+              aria-label="Send message"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+            <div className="text-xs text-white/40">{sending ? "Sending..." : ""}</div>
+          </div>
         </div>
       </form>
     </div>

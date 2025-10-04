@@ -10,6 +10,7 @@ import Navigation from './components/Navigation';
 
 type Tab = 'mega' | 'rooms' | 'onetoone' | 'leaderboard' | 'profile';
 
+
 function AppContent() {
   const { user, loading } = useAuth(); // <-- Get loading state
   const [activeTab, setActiveTab] = useState<Tab>('mega');
@@ -69,5 +70,6 @@ function App() {
     </AuthProvider>
   );
 }
+
 
 export default App;

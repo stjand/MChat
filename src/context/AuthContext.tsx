@@ -33,116 +33,160 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    checkUser();
+  let isInitialLoad = true;
+  let loadingTimeoutId: NodeJS.Timeout | null = null;
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
-      if (session?.user) {
-        await loadUserProfile(session.user.id, session.user);
-      } else {
-        setUser(null);
-        setUserMode('anonymous');
-      }
-    });
+  const forceStopLoading = () => {
+  console.log('Force stopping loading');
+  setLoading(false);
+};
 
-    return () => subscription.unsubscribe();
-  }, []);
+loadingTimeoutId = setTimeout(forceStopLoading, 2000);
 
-  const checkUser = async () => {
+  const init = async () => {
+    // Emergency timeout
+    loadingTimeoutId = setTimeout(forceStopLoading, 2000);
+
     try {
-      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      const { data: { session } } = await supabase.auth.getSession();
       
-      if (sessionError) {
-        console.error('Session error:', sessionError);
-        setError('Failed to load session');
-      }
-
       if (session?.user) {
-        await loadUserProfile(session.user.id, session.user);
+        try {
+          await Promise.race([
+            loadUserProfile(session.user.id, session.user),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 3000))
+          ]);
+        } catch (err) {
+          console.error('Profile load failed on init:', err);
+          await supabase.auth.signOut();
+        }
       }
     } catch (err) {
-      console.error('Error checking user:', err);
-      setError('Failed to authenticate');
+      console.error('Init error:', err);
     } finally {
-      // FIX: Use setTimeout to ensure setLoading(false) runs 
-      // as a separate task, guaranteeing state update.
-      setTimeout(() => {
-        setLoading(false);
-      }, 50); // A small delay of 50ms is usually enough
+      if (loadingTimeoutId) clearTimeout(loadingTimeoutId);
+      setLoading(false);
+      isInitialLoad = false;
     }
   };
 
-// ...
+  init();
+
+  // Handle page visibility changes (minimize/restore)
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === 'visible') {
+      console.log('Page became visible');
+      // If loading is stuck, force it to stop
+      if (loading) {
+        setTimeout(forceStopLoading, 1000);
+      }
+    }
+  };
+
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+
+  const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+    // Ignore state changes during initial load
+    if (isInitialLoad) return;
+
+    console.log('Auth state changed:', event);
+
+    if (event === 'SIGNED_OUT') {
+      setUser(null);
+      setUserMode('anonymous');
+      setLoading(false);
+    } else if (event === 'SIGNED_IN' && session?.user) {
+      setLoading(true);
+      
+      // Set timeout for this loading state too
+      const stateChangeTimeout = setTimeout(forceStopLoading, 2000);
+      
+      try {
+        await loadUserProfile(session.user.id, session.user);
+      } catch (err) {
+        console.error('Profile load failed:', err);
+        await supabase.auth.signOut();
+      } finally {
+        clearTimeout(stateChangeTimeout);
+        setLoading(false);
+      }
+    }
+  });
+
+  return () => {
+    if (loadingTimeoutId) clearTimeout(loadingTimeoutId);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    subscription.unsubscribe();
+  };
+}, []);
 
   const loadUserProfile = async (userId: string, authUser?: SupabaseUser) => {
     try {
-      let { data, error: fetchError } = await supabase
+      const { data, error: fetchError } = await supabase
         .from('users')
         .select('*')
         .eq('id', userId)
-        .single();
+        .maybeSingle();
 
-      // If profile doesn't exist, create it
-      if (fetchError && fetchError.code === 'PGRST116') {
-        if (!authUser) {
-          throw new Error('Cannot create profile without auth user data');
-        }
+      if (fetchError) throw fetchError;
+
+      if (!data) {
+        if (!authUser) throw new Error('No auth user');
 
         const isVerified = !!authUser.email;
-        const username = authUser.email 
-          ? authUser.email.split('@')[0] 
-          : generateAnonymousUsername();
+        const username = authUser.email?.split('@')[0] || generateAnonymousUsername();
 
-        const newUserProfile = {
-          id: userId,
-          username,
-          is_verified: isVerified,
-          gender: 'unspecified' as Gender,
-          college_email: authUser.email || null,
-          college_name: authUser.email ? extractCollegeName(authUser.email) : null,
-          karma_points: 0,
-          is_anonymous: !isVerified,
-          badges: isVerified ? ['verified'] : [],
-          daily_message_count: 0,
-        };
-
-        const { data: insertData, error: insertError } = await supabase
+        const { data: newUser, error: insertError } = await supabase
           .from('users')
-          .insert(newUserProfile)
+          .insert({
+            id: userId,
+            username,
+            is_verified: isVerified,
+            gender: 'unspecified',
+            college_email: authUser.email || null,
+            college_name: authUser.email ? extractCollegeName(authUser.email) : null,
+            karma_points: 0,
+            is_anonymous: !isVerified,
+            badges: isVerified ? ['verified'] : [],
+            daily_message_count: 0,
+          })
           .select()
           .single();
 
-        if (insertError) {
-          console.error('Error creating profile:', insertError);
-          throw insertError;
-        }
-        
-        data = insertData;
-      } else if (fetchError) {
-        console.error('Error fetching profile:', fetchError);
-        throw fetchError;
+        if (insertError) throw insertError;
+
+        setUser({
+          id: newUser.id,
+          username: newUser.username,
+          isVerified: newUser.is_verified,
+          gender: newUser.gender as Gender,
+          collegeEmail: newUser.college_email || undefined,
+          collegeName: newUser.college_name || undefined,
+          karmaPoints: newUser.karma_points,
+          isAnonymous: newUser.is_anonymous,
+          badges: newUser.badges || [],
+          dailyMessageCount: newUser.daily_message_count,
+        });
+        setUserMode(newUser.is_anonymous ? 'anonymous' : 'verified');
+        return;
       }
 
-      if (data) {
-        const userProfile: User = {
-          id: data.id,
-          username: data.username,
-          isVerified: data.is_verified,
-          gender: data.gender as Gender,
-          collegeEmail: data.college_email || undefined,
-          collegeName: data.college_name || undefined,
-          karmaPoints: data.karma_points,
-          isAnonymous: data.is_anonymous,
-          badges: data.badges || [],
-          dailyMessageCount: data.daily_message_count,
-        };
-
-        setUser(userProfile);
-        setUserMode(data.is_anonymous ? 'anonymous' : 'verified');
-        setError(null);
-      }
-    } catch (err) {
-      console.error('Error loading user profile:', err);
-      setError('Failed to load profile');
+      setUser({
+        id: data.id,
+        username: data.username,
+        isVerified: data.is_verified,
+        gender: data.gender as Gender,
+        collegeEmail: data.college_email || undefined,
+        collegeName: data.college_name || undefined,
+        karmaPoints: data.karma_points,
+        isAnonymous: data.is_anonymous,
+        badges: data.badges || [],
+        dailyMessageCount: data.daily_message_count,
+      });
+      setUserMode(data.is_anonymous ? 'anonymous' : 'verified');
+    } catch (err: any) {
+      console.error('Profile error:', err);
+      throw err;
     }
   };
 
@@ -151,165 +195,75 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setLoading(true);
 
     try {
-      const { data: authData, error: authError } = await supabase.auth.signInAnonymously();
-      
-      if (authError) {
-        throw new Error(`Anonymous sign-in failed: ${authError.message}`);
-      }
+      const { data, error: authError } = await supabase.auth.signInAnonymously();
+      if (authError || !data.user) throw new Error('Sign in failed');
 
-      if (!authData.user) {
-        throw new Error('No user returned from anonymous sign-in');
-      }
-
-      // Profile creation is now handled by database trigger or loadUserProfile
-      await loadUserProfile(authData.user.id, authData.user);
-      
+      await loadUserProfile(data.user.id, data.user);
     } catch (err: any) {
-      console.error('Error entering anonymous:', err);
-      setError(err.message || 'Failed to enter anonymously');
-      throw err;
+      setError(err.message);
+      alert('Failed to enter: ' + err.message);
     } finally {
       setLoading(false);
     }
   };
 
   const login = async (email: string, gender: Gender) => {
-    setError(null);
     setLoading(true);
-
     try {
-      // Validate email first
       const validation = validateCollegeEmail(email);
-      if (!validation.isValid) {
-        throw new Error(validation.error || 'Invalid email');
-      }
+      if (!validation.isValid) throw new Error(validation.error || 'Invalid email');
 
-      // Send magic link
-      const { error: signInError } = await supabase.auth.signInWithOtp({
+      const { error } = await supabase.auth.signInWithOtp({
         email: validation.email!,
         options: {
           emailRedirectTo: window.location.origin,
-          data: {
-            gender,
-            college_name: validation.collegeName,
-          },
+          data: { gender, college_name: validation.collegeName },
         },
       });
 
-      if (signInError) {
-        throw new Error(`Login failed: ${signInError.message}`);
-      }
-
-      // Success - user will receive email
-      setError(null);
-      
+      if (error) throw error;
+      alert('Check your email!');
     } catch (err: any) {
-      console.error('Error logging in:', err);
-      setError(err.message || 'Failed to send verification email');
-      throw err;
+      alert(err.message);
     } finally {
       setLoading(false);
     }
   };
 
   const logout = async () => {
-    setError(null);
-
-    try {
-      const { error: signOutError } = await supabase.auth.signOut();
-      
-      if (signOutError) {
-        throw new Error(`Logout failed: ${signOutError.message}`);
-      }
-
-      setUser(null);
-      setUserMode('anonymous');
-      
-    } catch (err: any) {
-      console.error('Error logging out:', err);
-      setError(err.message || 'Failed to logout');
-      throw err;
-    }
+    await supabase.auth.signOut();
+    setUser(null);
+    setUserMode('anonymous');
   };
 
   const updateKarma = async (points: number) => {
     if (!user) return;
-
-    try {
-      const newKarmaPoints = user.karmaPoints + points;
-
-      const { error: updateError } = await supabase
-        .from('users')
-        .update({ karma_points: newKarmaPoints })
-        .eq('id', user.id);
-
-      if (updateError) {
-        console.error('Error updating karma:', updateError);
-        return;
-      }
-
-      setUser({ ...user, karmaPoints: newKarmaPoints });
-      
-    } catch (err) {
-      console.error('Error updating karma:', err);
-    }
+    const newKarma = user.karmaPoints + points;
+    await supabase.from('users').update({ karma_points: newKarma }).eq('id', user.id);
+    setUser({ ...user, karmaPoints: newKarma });
   };
 
   const incrementMessageCount = async (): Promise<boolean> => {
-    if (!user) return false;
-
-    // Check limit for anonymous users
-    if (user.isAnonymous && user.dailyMessageCount >= 50) {
-      return false;
-    }
-
-    try {
-      const newCount = user.dailyMessageCount + 1;
-
-      const { error: updateError } = await supabase
-        .from('users')
-        .update({ daily_message_count: newCount })
-        .eq('id', user.id);
-
-      if (updateError) {
-        console.error('Error incrementing message count:', updateError);
-        return false;
-      }
-
-      setUser({ ...user, dailyMessageCount: newCount });
-      return true;
-      
-    } catch (err) {
-      console.error('Error incrementing message count:', err);
-      return false;
-    }
+    if (!user || (user.isAnonymous && user.dailyMessageCount >= 50)) return false;
+    const newCount = user.dailyMessageCount + 1;
+    const { error } = await supabase.from('users').update({ daily_message_count: newCount }).eq('id', user.id);
+    if (!error) setUser({ ...user, dailyMessageCount: newCount });
+    return !error;
   };
 
   const refreshUser = async () => {
-    if (user) {
-      await loadUserProfile(user.id);
-    }
+    if (user) await loadUserProfile(user.id);
   };
 
-  const clearError = () => {
-    setError(null);
-  };
+  const clearError = () => setError(null);
 
   return (
     <AuthContext.Provider value={{
-      user,
-      userMode,
-      loading, // Pass loading state
-      error,
-      login,
-      logout,
-      enterAnonymous,
-      updateKarma,
-      incrementMessageCount,
-      refreshUser,
-      clearError,
+      user, userMode, loading, error,
+      login, logout, enterAnonymous,
+      updateKarma, incrementMessageCount,
+      refreshUser, clearError,
     }}>
-      {/* ALWAYS render children. Loading state check is moved to AppContent. */}
       {children}
     </AuthContext.Provider>
   );
@@ -317,8 +271,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
 export function useAuth() {
   const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within AuthProvider');
-  }
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
   return context;
 }
