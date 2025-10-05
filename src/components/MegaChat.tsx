@@ -1,6 +1,5 @@
-// src/components/MegaChat.tsx
 import React, { useEffect, useRef, useState } from "react";
-import { Send, Flame, Heart, Eye, Laugh, Pin, Flag } from "lucide-react";
+import { Send, Shield } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { supabase } from "../lib/supabase";
 import { Message } from "../types";
@@ -33,9 +32,7 @@ export default function MegaChat() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const isLoadingMessages = useRef(false);
   const realtimeChannel = useRef<any>(null);
-  const initialized = useRef(false);
 
-  // ----- Load messages from Supabase -----
   const loadMessages = async () => {
     if (isLoadingMessages.current) return;
     isLoadingMessages.current = true;
@@ -44,20 +41,10 @@ export default function MegaChat() {
     try {
       const { data, error } = await supabase
         .from("messages")
-        .select(
-          `
-          id,
-          user_id,
-          content,
-          reactions,
-          is_pinned,
-          created_at,
-          users:users!inner (
-            username,
-            is_verified
-          )
-        `
-        )
+        .select(`
+          id, user_id, content, reactions, is_pinned, created_at,
+          users:users!inner (username, is_verified)
+        `)
         .eq("is_mega_chat", true)
         .order("created_at", { ascending: true })
         .limit(200);
@@ -71,7 +58,7 @@ export default function MegaChat() {
           return {
             id: m.id,
             userId: m.user_id,
-            username: u.is_verified ? `${u.username} ✅` : u.username,
+            username: u.username,
             content: m.content,
             isVerifiedAuthor: !!u.is_verified,
             reactions: m.reactions ?? defaultReactions,
@@ -89,11 +76,9 @@ export default function MegaChat() {
     }
   };
 
-  // ----- Realtime subscription -----
   const subscribeToMessages = () => {
     if (!user) return () => {};
 
-    // Cleanup old channel
     if (realtimeChannel.current) {
       try {
         supabase.removeChannel(realtimeChannel.current);
@@ -116,16 +101,8 @@ export default function MegaChat() {
             const { data, error } = await supabase
               .from("messages")
               .select(`
-                id,
-                user_id,
-                content,
-                reactions,
-                is_pinned,
-                created_at,
-                users (
-                  username,
-                  is_verified
-                )
+                id, user_id, content, reactions, is_pinned, created_at,
+                users (username, is_verified)
               `)
               .eq("id", insertedId)
               .single<DBMessage>();
@@ -135,7 +112,7 @@ export default function MegaChat() {
               const newMsg: Message = {
                 id: data.id,
                 userId: data.user_id,
-                username: u.is_verified ? `${u.username} ✅` : u.username,
+                username: u.username,
                 content: data.content,
                 isVerifiedAuthor: !!u.is_verified,
                 reactions: data.reactions ?? defaultReactions,
@@ -149,29 +126,8 @@ export default function MegaChat() {
           }
         }
       )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "messages", filter: "is_mega_chat=eq.true" },
-        (payload: any) => {
-          const updated = payload.new;
-          if (!updated?.id) return;
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === updated.id
-                ? { ...m, reactions: updated.reactions ?? m.reactions, isPinned: updated.is_pinned ?? m.isPinned }
-                : m
-            )
-          );
-        }
-      )
-      .subscribe((status) => {
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          console.warn("Realtime channel disconnected, retrying in 2s...");
-          setTimeout(subscribeToMessages, 2000);
-        }
-      });
+      .subscribe();
 
-    // Cleanup function
     return () => {
       if (realtimeChannel.current) {
         supabase.removeChannel(realtimeChannel.current);
@@ -180,33 +136,24 @@ export default function MegaChat() {
     };
   };
 
-  // ----- Auto-scroll -----
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // ----- Auto-resize textarea -----
   useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(200, ta.scrollHeight)}px`;
+    ta.style.height = `${Math.min(120, ta.scrollHeight)}px`;
   }, [newMessage]);
 
-  // ----- Initialize messages & subscription -----
   useEffect(() => {
     if (!user) return;
-
     loadMessages();
     const cleanup = subscribeToMessages();
-
-    return () => {
-      cleanup?.();
-      initialized.current = false; // Reset on unmount
-    };
+    return () => cleanup?.();
   }, [user?.id]);
 
-  // ----- Send message -----
   const handleSendMessage = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!newMessage.trim() || !user) return;
@@ -246,146 +193,98 @@ export default function MegaChat() {
     }
   };
 
-  const handleReaction = async (messageId: string, reaction: keyof Message["reactions"]) => {
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId
-          ? { ...m, reactions: { ...(m.reactions ?? defaultReactions), [reaction]: (m.reactions?.[reaction] ?? 0) + 1 } }
-          : m
-      )
-    );
-
-    try {
-      const msg = messages.find((m) => m.id === messageId);
-      if (!msg) return;
-      const updatedReactions = { ...(msg.reactions ?? defaultReactions), [reaction]: (msg.reactions?.[reaction] ?? 0) + 1 };
-      const { error } = await supabase.from("messages").update({ reactions: updatedReactions }).eq("id", messageId);
-      if (!error) await updateKarma?.(1);
-    } catch (err) {
-      console.error("Failed to update reaction:", err);
-    }
-  };
-
   const formatTime = (date: Date) => {
     const now = new Date();
     const diff = now.getTime() - date.getTime();
     const minutes = Math.floor(diff / 60000);
     const hours = Math.floor(diff / 3600000);
-    if (minutes < 1) return "just now";
+    if (minutes < 1) return "now";
     if (minutes < 60) return `${minutes}m`;
     if (hours < 24) return `${hours}h`;
-    return date.toLocaleDateString();
+    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   };
 
-  // ----- UI -----
   if (loading) {
     return (
-      <div className="flex h-full items-center justify-center bg-black text-gray-300">
-        <div className="text-center">
-          <div className="w-10 h-10 border-4 border-white/10 border-t-white rounded-full animate-spin mx-auto mb-3" />
-          <div>Loading messages...</div>
+      <div className="flex h-full items-center justify-center bg-white">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-3 border-slate-200 border-t-slate-900 rounded-full animate-spin" />
+          <p className="text-sm text-slate-600 font-medium">Loading messages...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full bg-black text-white">
-      {/* Header */}
-      <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
-        <div>
-          <h2 className="font-semibold text-lg">Mega Chat</h2>
-          <p className="text-xs text-white/50">Public room — be kind, be bold.</p>
+    <div className="flex flex-col h-screen bg-white">
+      <header className="px-6 py-4 border-b border-slate-100 bg-white">
+        <div className="max-w-4xl mx-auto">
+          <h2 className="text-xl font-semibold text-slate-900 tracking-tight">Mega Chat</h2>
+          <p className="text-sm text-slate-500 mt-1">Campus-wide public feed</p>
         </div>
-        <div className="text-xs text-white/40">Black & White theme</div>
-      </div>
+      </header>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-5 py-6 space-y-4">
-        {messages.length === 0 ? (
-          <div className="mt-10 flex flex-col items-center gap-2 text-white/60">
-            <div className="w-14 h-14 rounded-full bg-white/5 flex items-center justify-center">
-              <Send className="w-6 h-6" />
+      <div className="flex-1 overflow-y-auto px-4 py-6 bg-slate-50">
+        <div className="max-w-4xl mx-auto space-y-6">
+          {messages.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-20">
+              <div className="w-16 h-16 rounded-full bg-slate-100 flex items-center justify-center mb-4">
+                <Send className="w-7 h-7 text-slate-400" />
+              </div>
+              <p className="text-lg font-medium text-slate-900 mb-2">No messages yet</p>
+              <p className="text-sm text-slate-500">Be the first to start the conversation</p>
             </div>
-            <div className="text-lg">No messages yet</div>
-            <div className="text-sm">Say hello — your messages appear on the right.</div>
-          </div>
-        ) : (
-          messages.map((m) => {
-            const isMine = m.userId === user?.id;
-            return (
-              <div key={m.id} className={`flex ${isMine ? "justify-end" : "justify-start"} px-2`}>
-                {!isMine && (
-                  <div className="mr-3">
-                    <div className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center text-sm font-medium">
-                      {m.username?.[0] ?? "U"}
+          ) : (
+            messages.map((m) => {
+              const isMine = m.userId === user?.id;
+              return (
+                <div key={m.id} className={`flex gap-3 ${isMine ? 'flex-row-reverse' : ''}`}>
+                  {!isMine && (
+                    <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white text-sm font-semibold flex-shrink-0">
+                      {m.username?.[0]?.toUpperCase() || "A"}
                     </div>
-                  </div>
-                )}
+                  )}
 
-                <div className="max-w-[78%]">
-                  <div className={`flex items-center gap-2 ${isMine ? "justify-end" : ""}`}>
-                    {!isMine && <div className="text-sm font-medium text-white/90">{m.username}</div>}
-                    {m.isPinned && (
-                      <div className="text-xs text-amber-300 flex items-center gap-1 bg-amber-400/5 px-2 py-0.5 rounded-full">
-                        <Pin className="w-3 h-3" />
-                        Pinned
+                  <div className={`flex-1 max-w-2xl ${isMine ? 'flex flex-col items-end' : ''}`}>
+                    {!isMine && (
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span className="text-sm font-medium text-slate-900">{m.username}</span>
+                        {m.isVerifiedAuthor && (
+                          <Shield className="w-3.5 h-3.5 text-emerald-500" />
+                        )}
+                        <span className="text-xs text-slate-400">{formatTime(m.createdAt)}</span>
+                      </div>
+                    )}
+
+                    <div
+                      className={`px-4 py-3 rounded-2xl ${
+                        isMine
+                          ? 'bg-slate-900 text-white'
+                          : 'bg-white border border-slate-200 text-slate-900'
+                      }`}
+                    >
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                        {m.content}
+                      </p>
+                    </div>
+
+                    {isMine && (
+                      <div className="flex items-center gap-2 mt-1.5">
+                        <span className="text-xs text-slate-400">{formatTime(m.createdAt)}</span>
                       </div>
                     )}
                   </div>
 
-                  <div
-                    className={`mt-1 rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
-                      isMine
-                        ? "bg-white text-black rounded-br-none shadow-white/5"
-                        : "bg-white/5 text-white rounded-bl-none"
-                    }`}
-                    style={{ wordBreak: "break-word" }}
-                  >
-                    <div className="whitespace-pre-wrap">{m.content}</div>
-                  </div>
-
-                  <div className={`mt-2 flex items-center gap-3 text-xs ${isMine ? "justify-end" : ""}`}>
-                    <div className="text-white/50">{formatTime(new Date(m.createdAt))}</div>
-                    <button className="p-1 rounded hover:bg-white/5">
-                      <Flag className="w-4 h-4 text-white/60" />
-                    </button>
-
-                    <div className="flex items-center gap-2">
-                      {(
-                        [
-                          { Icon: Flame, key: "fire" },
-                          { Icon: Laugh, key: "laugh" },
-                          { Icon: Heart, key: "heart" },
-                          { Icon: Eye, key: "eyes" },
-                        ] as const
-                      ).map(({ Icon, key }) => {
-                        const count = (m.reactions as any)?.[key] ?? 0;
-                        return (
-                          <button
-                            key={key}
-                            onClick={() => handleReaction(m.id, key as keyof Message["reactions"])}
-                            className="flex items-center gap-1 px-2 py-1 rounded-full bg-white/3 hover:bg-white/8 text-xs"
-                          >
-                            <Icon className="w-4 h-4" />
-                            {count > 0 && <span className="text-xs">{count}</span>}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
+                  {isMine && <div className="w-9" />}
                 </div>
-
-                {isMine && <div className="ml-3 w-10" />}
-              </div>
-            );
-          })
-        )}
-        <div ref={messagesEndRef} />
+              );
+            })
+          )}
+          <div ref={messagesEndRef} />
+        </div>
       </div>
 
-      {/* Message input */}
-      <form onSubmit={handleSendMessage} className="p-4 border-t border-white/5 bg-black/95">
+      <form onSubmit={handleSendMessage} className="px-6 py-4 border-t border-slate-100 bg-white">
         <div className="max-w-4xl mx-auto flex items-end gap-3">
           <div className="flex-1">
             <textarea
@@ -393,28 +292,27 @@ export default function MegaChat() {
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={user?.isAnonymous ? `${50 - (user?.dailyMessageCount || 0)} messages left today...` : "Write a message — Enter to send, Shift+Enter for newline"}
-              className="w-full min-h-[44px] max-h-[200px] resize-none bg-white/5 placeholder-white/40 text-white px-4 py-3 rounded-xl focus:outline-none focus:ring-1 focus:ring-white/10"
+              placeholder="Type a message..."
+              className="w-full min-h-[44px] max-h-[120px] resize-none px-4 py-3 border border-slate-200 rounded-xl text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent"
               maxLength={500}
-              aria-label="Write a message"
             />
-            <div className="flex justify-between text-xs text-white/40 mt-1">
-              <div>{newMessage.length}/500</div>
-              {user?.isAnonymous ? <div className="text-amber-400">Get verified for unlimited messages</div> : <div />}
+            <div className="flex justify-between items-center mt-2">
+              <span className="text-xs text-slate-400">{newMessage.length}/500</span>
+              {user?.isAnonymous && (
+                <span className="text-xs text-slate-500">
+                  {50 - (user?.dailyMessageCount || 0)} messages left today
+                </span>
+              )}
             </div>
           </div>
 
-          <div className="flex flex-col items-center gap-2">
-            <button
-              type="submit"
-              disabled={!newMessage.trim() || sending}
-              className={`p-3 rounded-full transition-transform ${!newMessage.trim() || sending ? "bg-white/10 cursor-not-allowed" : "bg-white text-black hover:scale-105"}`}
-              aria-label="Send message"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-            <div className="text-xs text-white/40">{sending ? "Sending..." : ""}</div>
-          </div>
+          <button
+            type="submit"
+            disabled={!newMessage.trim() || sending}
+            className="p-3 bg-slate-900 text-white rounded-xl hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0"
+          >
+            <Send className="w-5 h-5" />
+          </button>
         </div>
       </form>
     </div>

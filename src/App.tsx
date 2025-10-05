@@ -2,25 +2,26 @@ import { useState } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import WelcomeScreen from './components/WelcomeScreen';
 import MegaChat from './components/MegaChat';
-import SmallRooms from './components/SmallRooms';
-import OneToOne from './components/OneToOne';
+import PrivateChat from './components/PrivateChat';
 import Leaderboard from './components/Leaderboard';
 import Profile from './components/Profile';
-import Navigation from './components/Navigation';
+import Sidebar from './components/sidebar';
+import MobileNav from './components/mobileNav';
 
-type Tab = 'mega' | 'rooms' | 'onetoone' | 'leaderboard' | 'profile';
-
+type Tab = 'mega' | 'private' | 'leaderboard' | 'profile';
 
 function AppContent() {
-  const { user, loading } = useAuth(); // <-- Get loading state
+  const { user, loading } = useAuth();
   const [activeTab, setActiveTab] = useState<Tab>('mega');
 
-  // FIX: Render a loading screen while auth is checking the session
   if (loading) {
     return (
-        <div className="h-screen flex items-center justify-center bg-slate-900">
-            <div className="text-white text-xl font-bold">Loading CampusChat...</div>
+      <div className="min-h-screen bg-white flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-3 border-slate-200 border-t-slate-900 rounded-full animate-spin" />
+          <p className="text-sm text-slate-600 font-medium">Loading CampusChat...</p>
         </div>
+      </div>
     );
   }
 
@@ -29,36 +30,17 @@ function AppContent() {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-slate-900">
-      <header className="bg-slate-800 border-b border-slate-700 p-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-lg flex items-center justify-center">
-              <span className="text-white font-bold text-sm">CC</span>
-            </div>
-            <div>
-              <h1 className="text-white font-bold text-lg">CampusChat</h1>
-              <p className="text-slate-400 text-xs">Always active, always anonymous</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <div className="text-right">
-              <p className="text-slate-400 text-xs">Karma</p>
-              <p className="text-amber-400 font-bold">{user.karmaPoints}</p>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      <main className="flex-1 overflow-hidden">
+    <div className="min-h-screen bg-white flex">
+      <Sidebar activeTab={activeTab} onTabChange={setActiveTab} user={user} />
+      
+      <main className="flex-1 flex flex-col pb-16 lg:pb-0">
         {activeTab === 'mega' && <MegaChat />}
-        {activeTab === 'rooms' && <SmallRooms />}
-        {activeTab === 'onetoone' && <OneToOne />}
+        {activeTab === 'private' && <PrivateChat />}
         {activeTab === 'leaderboard' && <Leaderboard />}
         {activeTab === 'profile' && <Profile />}
       </main>
 
-      <Navigation activeTab={activeTab} onTabChange={setActiveTab} />
+      <MobileNav activeTab={activeTab} onTabChange={setActiveTab} />
     </div>
   );
 }
@@ -70,6 +52,5 @@ function App() {
     </AuthProvider>
   );
 }
-
 
 export default App;
